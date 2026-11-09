@@ -1,0 +1,111 @@
+// .NET BinaryFormatter (MS-NRBF): Unity .dat / .data saves. Values are patched in place.
+function parseNrbf(b) {
+  const P = Patcher(b), r = new Rd(b), objects = new Map(), classes = new Map(), fix = [];
+  const REF = Symbol('ref'), NULLS = Symbol('nulls'), END = Symbol('end');
+  const lenPrefix = () => { let n = 0, shift = 0, x; do { x = r.u8(); n |= (x & 0x7f) << shift; shift += 7; } while (x & 0x80 && shift < 35); return n; };
+  const encLps = s => { const u = te8.encode(s), pre = []; let n = u.length; do { pre.push((n & 0x7f) | (n > 0x7f ? 0x80 : 0)); n >>>= 7; } while (n); return concat([Uint8Array.from(pre), u]); };
+  const lpsRaw = () => td8.decode(r.bytes(lenPrefix()));
+  const lpsBox = () => { const s = r.o, v = lpsRaw(); return P.leaf('str', v, s, r.o - s, encLps); };
+  const prim = { 2: 'u8', 7: 'i16', 8: 'i32', 9: 'i64', 10: 'i8', 11: 'f32', 6: 'f64', 12: 'i64', 13: 'u64', 14: 'u16', 15: 'u32', 16: 'u64' };
+  function primitive(pt) {
+    if (prim[pt]) return P.num(r, prim[pt]);
+    const s = r.o;
+    switch (pt) {
+      case 1: return P.leaf('bool', !!r.u8(), s, 1, v => Uint8Array.of(v ? 1 : 0));
+      case 3: { // UTF-8 char
+        const c = r.b[s], n = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+        return P.leaf('str', td8.decode(r.bytes(n)), s, n, v => te8.encode([...v][0] ?? ' '), { max: 1 });
+      }
+      case 5: case 18: return lpsBox();
+      default: throw Error(`unknown primitive type ${pt}`);
+    }
+  }
+  function addInfo(bt) {
+    if (bt === 0 || bt === 7) return r.u8();
+    if (bt === 3) return lpsRaw();
+    if (bt === 4) { const n = lpsRaw(); r.i32(); return n; }
+    return null;
+  }
+  function classInfo(withTypes, sys) {
+    const id = r.i32(), name = lpsRaw(), n = r.i32(), names = Array.from({ length: n }, lpsRaw);
+    let types = null;
+    if (withTypes) { const bts = Array.from({ length: n }, () => r.u8()); types = bts.map(bt => ({ bt, info: addInfo(bt) })); }
+    if (!sys) r.i32(); // library id
+    const meta = { name, names, types };
+    classes.set(id, meta);
+    return members(id, meta);
+  }
+  function members(id, meta) {
+    const o = { [LABEL]: meta.name.replace(/\[\[.*$/, '').replace(/`\d+$/, '').split('.').pop() };
+    objects.set(id, o);
+    meta.names.forEach((name, i) => {
+      const t = meta.types?.[i];
+      o[name] = t && t.bt === 0 ? primitive(t.info) : value(o, name);
+    });
+    return o;
+  }
+  function value(parent, key) {
+    for (;;) {
+      const v = record();
+      if (v === undefined) continue; // library record
+      if (v && v[REF] !== undefined) { fix.push([parent, key, v[REF]]); return null; }
+      return v;
+    }
+  }
+  function elements(id, n, read) {
+    const a = []; objects.set(id, a);
+    if (read === 'byte') {
+      if (n > 4096) { r.bytes(n); a.push(ro(`<${n} bytes>`)); return a; }
+      read = () => P.num(r, 'u8');
+    }
+    while (a.length < n) {
+      if (typeof read === 'function') { a.push(read()); continue; }
+      const v = value(a, a.length);
+      if (v && v[NULLS]) for (let k = v[NULLS]; k--;) a.push(null); else a.push(v);
+    }
+    return a;
+  }
+  function record() {
+    const rt = r.u8();
+    switch (rt) {
+      case 0: { const root = r.i32(); r.i32(); r.i32(); r.i32(); return { header: root }; }
+      case 1: { const id = r.i32(), meta = classes.get(r.i32()); if (!meta) throw Error('unknown class metadata'); return members(id, meta); }
+      case 2: return classInfo(false, true);
+      case 3: return classInfo(false, false);
+      case 4: return classInfo(true, true);
+      case 5: return classInfo(true, false);
+      case 6: { const id = r.i32(), v = lpsBox(); objects.set(id, v); return v; }
+      case 7: {
+        const id = r.i32(), kind = r.u8(), rank = r.i32();
+        const lens = Array.from({ length: rank }, () => r.i32());
+        if (kind >= 3) for (let i = 0; i < rank; i++) r.i32();
+        const bt = r.u8(), info = addInfo(bt), n = lens.reduce((x, y) => x * y, 1);
+        return elements(id, n, bt === 0 ? (info === 2 ? 'byte' : () => primitive(info)) : null);
+      }
+      case 8: return primitive(r.u8());
+      case 9: return { [REF]: r.i32() };
+      case 10: return null;
+      case 11: return END;
+      case 12: r.i32(); lpsRaw(); return undefined;
+      case 13: return { [NULLS]: r.u8() };
+      case 14: return { [NULLS]: r.i32() };
+      case 15: { const id = r.i32(), n = r.i32(), pt = r.u8(); return elements(id, n, pt === 2 ? 'byte' : () => primitive(pt)); }
+      case 16: case 17: { const id = r.i32(), n = r.i32(); return elements(id, n, null); }
+      default: throw Error(`unsupported BinaryFormatter record ${rt} at byte ${r.o - 1}`);
+    }
+  }
+  const head = record();
+  if (!head || head.header === undefined) throw Error('missing BinaryFormatter header');
+  while (record() !== END) { /* top-level objects, referenced by id */ }
+  for (const [p, k, id] of fix) p[k] = objects.has(id) ? objects.get(id) : ro(`missing object ${id}`);
+  return { P, root: objects.get(head.header) };
+}
+
+FORMATS.push({
+  id: 'nrbf', label: 'Unity / .NET BinaryFormatter (.dat)', exts: ['dat', 'data', 'sav', 'save'],
+  test: b => b[0] === 0 && b[1] === 1 && b[2] === 0 && b[5] === 0xff && b[6] === 0xff,
+  open(b) {
+    const { P, root } = parseNrbf(b);
+    return { root: root && typeof root === 'object' && !isBox(root) ? root : { root }, save: () => P.save() };
+  },
+});

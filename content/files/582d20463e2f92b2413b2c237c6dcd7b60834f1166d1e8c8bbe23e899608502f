@@ -1,0 +1,93 @@
+// JSON-based saves: plain JSON, RPG Maker MV/MZ, SugarCube, TyranoScript,
+// Naninovel, Easy Save 3 (incl. AES), base64 JSON.
+// shortcut: integers above 2^53 lose precision (JSON.parse), fine for game saves.
+function jsonDoc(text, wrap) {
+  const bom = text.charCodeAt(0) === 0xfeff;
+  if (bom) text = text.slice(1);
+  const root = JSON.parse(text);
+  if (root === null || typeof root !== 'object') throw Error('JSON is not an object');
+  const indent = (/^[{[]\r?\n([ \t]+)/.exec(text) || [])[1];
+  return { root, save: async () => wrap((bom ? '﻿' : '') + JSON.stringify(root, null, indent)) };
+}
+const looksJson = s => /^﻿?\s*[{[]/.test(s);
+const head = (b, n = 64) => latin1(b.subarray(0, n));
+
+FORMATS.push(
+  {
+    id: 'json', label: 'JSON (any engine, Naninovel, Easy Save 3)', exts: ['json', 'nson', 'es3', 'dat', 'data', 'sav', 'save', 'txt'],
+    test: b => looksJson(head(b)),
+    open: b => jsonDoc(td8.decode(b), s => te8.encode(s)),
+  },
+  {
+    id: 'lz', label: 'RPG Maker MV / Twine SugarCube (LZString)', exts: ['rpgsave', 'save'],
+    test: (b, n) => ['rpgsave', 'save'].includes(ext(n)) && /^[A-Za-z0-9+/=\s]+$/.test(head(b)),
+    open(b) {
+      const s = LZString.decompressFromBase64(latin1(b).trim());
+      if (!s) throw Error('not LZString data');
+      return jsonDoc(s, s => te8.encode(LZString.compressToBase64(s)));
+    },
+  },
+  {
+    id: 'mz', label: 'RPG Maker MZ (.rmmzsave)', exts: ['rmmzsave'],
+    test: (b, n) => ext(n) === 'rmmzsave',
+    // MZ writes zlib bytes as a "binary string" through a UTF-8 file write
+    open(b) {
+      const t = td8.decode(b);
+      if (/[^\x00-\xff]/.test(t)) throw Error('not MZ data');
+      return jsonDoc(pako.inflate(fromLatin1(t), { to: 'string' }),
+        s => te8.encode(latin1(pako.deflate(s, { level: 1 }))));
+    },
+  },
+  {
+    id: 'tyrano', label: 'TyranoScript (.sav)', exts: ['sav'],
+    test: b => head(b, 3) === '%7B',
+    open: b => jsonDoc(unescape(td8.decode(b).trim()), s => te8.encode(escape(s))),
+  },
+  {
+    id: 'b64', label: 'Base64 JSON (Unity and others)', exts: ['dat', 'data', 'sav', 'txt'],
+    test: b => { try { return /^[A-Za-z0-9+/=\s]+$/.test(head(b)) && /^\s*[{[]/.test(atob(head(b, 8).trim())); } catch { return false; } },
+    open: b => jsonDoc(td8.decode(fromLatin1(atob(latin1(b).trim()))), s => fromLatin1(btoa(latin1(te8.encode(s))))),
+  },
+  {
+    id: 'zjson', label: 'Compressed JSON (Naninovel binary, Easy Save 3 gzip)', exts: ['nson', 'es3', 'dat', 'sav'],
+    test: b => b[0] === 0x1f && b[1] === 0x8b || b[0] === 0x78,
+    open(b) {
+      const [mode, text] = unpack(b);
+      return jsonDoc(text, s => repack(mode, s));
+    },
+  },
+  {
+    id: 'es3aes', label: 'Easy Save 3, encrypted (.es3)', exts: ['es3', 'dat', 'sav'],
+    test: (b, n) => ext(n) === 'es3',
+    async open(b, n, ctx) {
+      const iv = b.slice(0, 16), body = b.subarray(16);
+      for (let pw = 'password'; pw != null; pw = await ctx.ask('Easy Save 3 password for this game (check its ES3 settings):')) {
+        try {
+          const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, await es3Key(pw, iv), body));
+          const gz = plain[0] === 0x1f && plain[1] === 0x8b;
+          const text = gz ? pako.ungzip(plain, { to: 'string' }) : td8.decode(plain);
+          return jsonDoc(text, async s => {
+            const iv2 = crypto.getRandomValues(new Uint8Array(16));
+            const data = gz ? pako.gzip(s) : te8.encode(s);
+            return concat([iv2, new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-CBC', iv: iv2 }, await es3Key(pw, iv2), data))]);
+          });
+        } catch { /* wrong password, ask again */ }
+      }
+      throw Error('no password given');
+    },
+  },
+);
+
+function unpack(b) {
+  for (const [mode, fn] of [['gzip', 'ungzip'], ['zlib', 'inflate'], ['raw', 'inflateRaw']]) {
+    try { const t = pako[fn](b, { to: 'string' }); if (looksJson(t)) return [mode, t]; } catch {}
+  }
+  throw Error('not compressed JSON');
+}
+const repack = (mode, s) => pako[{ gzip: 'gzip', zlib: 'deflate', raw: 'deflateRaw' }[mode]](s);
+
+// ES3: key = PBKDF2-SHA1(password, salt = IV, 100 iterations), AES-128-CBC, IV prepended
+async function es3Key(pw, iv) {
+  const base = await crypto.subtle.importKey('raw', te8.encode(pw), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-1', salt: iv, iterations: 100 }, base, { name: 'AES-CBC', length: 128 }, false, ['encrypt', 'decrypt']);
+}

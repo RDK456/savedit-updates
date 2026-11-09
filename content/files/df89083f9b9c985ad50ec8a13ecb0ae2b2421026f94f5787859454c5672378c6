@@ -1,0 +1,115 @@
+// Ruby Marshal 4.8: RPG Maker XP (.rxdata), VX (.rvdata), VX Ace (.rvdata2).
+// Saves are several Marshal dumps back to back. Edits patch tokens in place;
+// fixnums must stay fixnums so the object-link table never shifts.
+function rLong(r) {
+  const c = r.i8();
+  if (c === 0) return 0;
+  if (c > 4) return c - 5;
+  if (c < -4) return c + 5;
+  const n = Math.abs(c); let x = 0;
+  for (let i = 0; i < n; i++) x += r.u8() * 256 ** i;
+  return c > 0 ? x : x - 256 ** n;
+}
+function wLong(x) {
+  if (x === 0) return [0];
+  if (x > 0 && x < 123) return [x + 5];
+  if (x < 0 && x > -124) return [(x - 5) & 0xff];
+  const out = [];
+  for (let i = 1; i <= 4; i++) {
+    out.push(x & 0xff); x >>= 8;
+    if (x === 0) return [i, ...out];
+    if (x === -1) return [-i & 0xff, ...out];
+  }
+  throw Error('integer too large for Marshal fixnum');
+}
+const rbFloatStr = v => Number.isNaN(v) ? 'nan' : v === Infinity ? 'inf' : v === -Infinity ? '-inf' : Object.is(v, -0) ? '-0' : String(v);
+
+function parseMarshal(b) {
+  const P = Patcher(b), r = new Rd(b), dumps = [];
+  while (!r.eof) {
+    if (r.u8() !== 4 || r.u8() !== 8) throw Error(`not a Ruby Marshal 4.8 dump at byte ${r.o - 2}`);
+    dumps.push(readDump());
+  }
+  return { P, dumps };
+
+  function readDump() {
+    const syms = [], objs = [];
+    const reg = v => (objs.push(v), v);
+    const str = () => r.bytes(rLong(r));
+    function sym() {
+      const c = r.u8();
+      if (c === 0x3a) { const s = td8.decode(str()); syms.push(s); return s; }
+      if (c === 0x3b) return syms[rLong(r)];
+      if (c === 0x49) { const s = sym(); for (let n = rLong(r); n--;) { sym(); value(); } return s; }
+      throw Error(`expected symbol at byte ${r.o - 1}`);
+    }
+    function value() {
+      const s = r.o, c = String.fromCharCode(r.u8());
+      switch (c) {
+        case '0': return null;
+        case 'T': case 'F': return P.leaf('bool', c === 'T', s, 1, v => Uint8Array.of(v ? 0x54 : 0x46));
+        case 'i': { const v = rLong(r); return P.leaf('int', v, s, r.o - s, v => Uint8Array.of(0x69, ...wLong(v)), { min: -(2 ** 30), max: 2 ** 30 - 1 }); }
+        case 'l': {
+          const sign = r.u8(), mag = r.bytes(rLong(r) * 2);
+          let x = 0n; for (let i = mag.length - 1; i >= 0; i--) x = (x << 8n) | BigInt(mag[i]);
+          if (sign === 0x2d) x = -x;
+          return reg(P.leaf('int', Number.isSafeInteger(Number(x)) ? Number(x) : x, s, r.o - s, v => {
+            let m = BigInt(v), neg = m < 0n; if (neg) m = -m;
+            const out = []; while (m > 0n || out.length === 0) { out.push(Number(m & 0xffn)); m >>= 8n; }
+            if (out.length % 2) out.push(0);
+            return Uint8Array.of(0x6c, neg ? 0x2d : 0x2b, ...wLong(out.length / 2), ...out);
+          }));
+        }
+        case 'f': {
+          const t = latin1(str()).split('\0')[0];
+          const v = t === 'inf' ? Infinity : t === '-inf' ? -Infinity : t === 'nan' ? NaN : parseFloat(t);
+          return reg(P.leaf('float', v, s, r.o - s, v => { const u = te8.encode(rbFloatStr(v)); return Uint8Array.of(0x66, ...wLong(u.length), ...u); }));
+        }
+        case '"': {
+          const u = str(); let t;
+          try { t = utf8Strict(u); } catch { return reg(ro(latin1(u))); }
+          return reg(P.leaf('str', t, s, r.o - s, v => { const x = te8.encode(v); return concat([Uint8Array.of(0x22, ...wLong(x.length)), x]); }));
+        }
+        case 'I': { const v = value(); for (let n = rLong(r); n--;) { sym(); value(); } return v; }
+        case ':': case ';': r.o = s; return ro(sym());
+        case '@': { const i = rLong(r); if (i >= objs.length) throw Error(`bad Marshal link ${i}`); return objs[i]; }
+        case '[': { const a = reg([]); for (let n = rLong(r); n--;) a.push(value()); return a; }
+        case '{': case '}': {
+          const m = reg(new Map());
+          for (let n = rLong(r); n--;) { const k = value(); m.set(k, value()); }
+          if (c === '}') value(); // default value
+          return m;
+        }
+        case 'o': case 'S': {
+          const o = { [LABEL]: sym() }; reg(o);
+          for (let n = rLong(r); n--;) { const k = sym(); o[k] = value(); }
+          return o;
+        }
+        case 'u': {
+          const cls = sym(), len = rLong(r), at = r.o; r.bytes(len);
+          const names = { Color: ['red', 'green', 'blue', 'alpha'], Tone: ['red', 'green', 'blue', 'gray'] }[cls];
+          if (!names || len !== 32) return reg(ro(`${cls} <${len} bytes>`));
+          const sub = new Rd(b, at), o = { [LABEL]: cls };
+          for (const k of names) o[k] = P.num(sub, 'f64');
+          return reg(o);
+        }
+        case 'U': { const o = reg({ [LABEL]: sym() }); o.data = value(); return o; }
+        case 'e': sym(); return value();
+        case 'C': { const cls = sym(), v = value(); if (v && typeof v === 'object' && !isBox(v)) v[LABEL] = cls; return v; }
+        case '/': { const v = reg(ro(`/${latin1(str())}/`)); r.u8(); return v; }
+        case 'c': case 'm': case 'M': return reg(ro(td8.decode(str())));
+        default: throw Error(`unsupported Marshal type '${c}' at byte ${s}`);
+      }
+    }
+    return value();
+  }
+}
+
+FORMATS.push({
+  id: 'marshal', label: 'RPG Maker XP / VX / VX Ace (Ruby Marshal)', exts: ['rxdata', 'rvdata', 'rvdata2'],
+  test: b => b[0] === 4 && b[1] === 8,
+  open(b) {
+    const { P, dumps } = parseMarshal(b);
+    return { root: dumps.length === 1 ? { data: dumps[0] } : dumps, save: () => P.save() };
+  },
+});

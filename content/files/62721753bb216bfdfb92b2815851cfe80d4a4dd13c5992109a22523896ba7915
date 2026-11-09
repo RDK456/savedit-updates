@@ -1,0 +1,179 @@
+// Python pickle (protocols 0-5): Ren'Py saves (.save zip -> "log"), Ren'Py persistent, raw pickles.
+// Values are edited by patching their opcode bytes in place; object graph and memo stay untouched.
+class PyObj {
+  constructor(cls, args, how) { Object.assign(this, { cls, args, how }); }
+  get [LABEL]() {
+    const c = this.how === 'reduce' && /_reconstructor$/.test(this.cls?.v) ? this.args?.[0] : this.cls;
+    return isBox(c) ? c.v.split('.').pop() : 'object';
+  }
+  [KIDS]() {
+    const k = [];
+    // state is usually the instance __dict__, or (dict, slots) for slotted classes
+    const st = Array.isArray(this.state) && this.state[LABEL] === 'tuple' ? this.state : [this.state];
+    for (const s of st) if (s instanceof Map) k.push(...kidsOf(s)); else if (s != null) k.push(['__state__', { v: s }, 'v']);
+    if (this.items) k.push(...kidsOf(this.items));
+    if (this.list) this.list.forEach((v, i) => k.push([`[${i}]`, this.list, i]));
+    if (this.args?.length) k.push(['__args__', this, 'args']);
+    if (this.kwargs) k.push(['__kwargs__', this, 'kwargs']);
+    return k;
+  }
+}
+
+function encPyInt(v) {
+  if (typeof v === 'number' && v >= 0 && v < 256) return Uint8Array.of(0x4b, v);
+  if (typeof v === 'number' && v >= 0 && v < 65536) return W().u8(0x4d).num('Uint16', v).out;
+  if (v >= -(2 ** 31) && v < 2 ** 31) return W().u8(0x4a).num('Int32', Number(v)).out;
+  return encPyLong(v);
+}
+function encPyLong(v) {
+  let x = BigInt(v); const out = [];
+  if (x !== 0n) for (;;) {
+    const byte = Number(x & 0xffn); out.push(byte); x >>= 8n;
+    if ((x === 0n && !(byte & 0x80)) || (x === -1n && (byte & 0x80))) break;
+  }
+  return out.length < 256 ? Uint8Array.of(0x8a, out.length, ...out) : W().u8(0x8b).num('Int32', out.length).bytes(out).out;
+}
+function decPyLong(bytes) {
+  let x = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) x = (x << 8n) | BigInt(bytes[i]);
+  if (bytes.length && bytes[bytes.length - 1] & 0x80) x -= 1n << BigInt(8 * bytes.length);
+  return Number.isSafeInteger(Number(x)) ? Number(x) : x;
+}
+const strTok = (op, lenKind) => s => { const u = te8.encode(s); return W().u8(op).num(lenKind, u.length).bytes(u).out; };
+
+function parsePickle(b) {
+  const P = Patcher(b), r = new Rd(b), stack = [], marks = [], memo = new Map(), frames = [];
+  let proto = 0;
+  const push = v => stack.push(v), pop = () => { if (!stack.length) throw Error('pickle stack underflow'); return stack.pop(); };
+  const popMark = () => { if (!marks.length) throw Error('pickle mark missing'); return stack.splice(marks.pop()); };
+  const top = () => stack[stack.length - 1];
+  const tuple = a => (a[LABEL] = 'tuple', a);
+  const glob = (mod, name) => ro(`${mod}.${name}`, { mod, name });
+  const leaf = (t, v, start, enc, extra) => push(P.leaf(t, v, start, r.o - start, enc, extra));
+  const int = (v, start) => leaf('int', v, start, encPyInt, proto < 2 ? { min: -(2 ** 31), max: 2 ** 31 - 1 } : {});
+  const pystr = (bytes, start, short) => {
+    try { leaf('str', utf8Strict(bytes), start, s => { const u = te8.encode(s); return u.length < 256 ? Uint8Array.of(0x55, u.length, ...u) : W().u8(0x54).num('Int32', u.length).bytes(u).out; }); }
+    catch { push(ro(latin1(bytes))); }
+  };
+  const bytesLeaf = (bytes, start) => bytes.length > 4096 ? push(ro(`<${bytes.length} bytes>`))
+    : leaf('hex', hex(bytes), start, s => { const u = unhex(s); return W().u8(0x42).num('Uint32', u.length).bytes(u).out; });
+  const append = (t, items) => Array.isArray(t) ? t.push(...items) : (t.list ??= []).push(...items);
+  const setItems = (t, kv) => { const m = t instanceof Map ? t : (t.items ??= new Map()); for (let i = 0; i < kv.length; i += 2) m.set(kv[i], kv[i + 1]); };
+  const mapFrom = kv => { const m = new Map(); setItems(m, kv); return m; };
+
+  for (;;) {
+    const s = r.o, op = r.u8();
+    switch (op) {
+      case 0x80: proto = r.u8(); break;
+      case 0x95: frames.push(s); r.bytes(8); break;
+      case 0x2e: return { P, root: pop(), frames };
+      case 0x28: marks.push(stack.length); break;
+      case 0x30: stack.length > (marks.at(-1) ?? -1) ? pop() : popMark(); break;
+      case 0x31: popMark(); break;
+      case 0x32: push(top()); break;
+      case 0x4e: push(null); break;
+      case 0x88: case 0x89: leaf('bool', op === 0x88, s, v => Uint8Array.of(v ? 0x88 : 0x89)); break;
+      case 0x4b: int(r.u8(), s); break;
+      case 0x4d: int(r.u16(), s); break;
+      case 0x4a: int(r.i32(), s); break;
+      case 0x8a: leaf('int', decPyLong(r.bytes(r.u8())), s, encPyLong); break;
+      case 0x8b: leaf('int', decPyLong(r.bytes(r.i32())), s, encPyLong); break;
+      case 0x49: {
+        const t = r.line();
+        if (t === '01' || t === '00') leaf('bool', t === '01', s, v => te8.encode(v ? 'I01\n' : 'I00\n'));
+        else { const n = BigInt(t); leaf('int', Number.isSafeInteger(Number(n)) ? Number(n) : n, s, v => te8.encode(`I${v}\n`)); }
+        break;
+      }
+      case 0x4c: { const n = BigInt(r.line().replace(/L$/, '')); leaf('int', Number.isSafeInteger(Number(n)) ? Number(n) : n, s, v => te8.encode(`L${v}L\n`)); break; }
+      case 0x47: leaf('float', r.f64(false), s, v => W().u8(0x47).num('Float64', v, false).out); break;
+      case 0x46: leaf('float', parseFloat(r.line()), s, v => te8.encode(`F${v}\n`)); break;
+      case 0x58: { const u = r.bytes(r.u32()); leaf('str', td8.decode(u), s, strTok(0x58, 'Uint32')); break; }
+      case 0x8c: { const u = r.bytes(r.u8()); leaf('str', td8.decode(u), s, strTok(0x58, 'Uint32')); break; }
+      case 0x8d: { const u = r.bytes(Number(r.u64())); leaf('str', td8.decode(u), s, strTok(0x58, 'Uint32')); break; }
+      case 0x56: { // protocol 0 text: raw-unicode-escape
+        const t = r.line().replace(/\\u([0-9a-f]{4})|\\U([0-9a-f]{8})/gi, (_, a, b) => String.fromCodePoint(parseInt(a || b, 16)));
+        leaf('str', t, s, v => fromLatin1('V' + Array.from(v, c => {
+          const x = c.codePointAt(0);
+          return x > 0xffff ? '\\U' + x.toString(16).padStart(8, '0') : x > 0xff || '\\\0\n\r\x1a'.includes(c) ? '\\u' + x.toString(16).padStart(4, '0') : c;
+        }).join('') + '\n'));
+        break;
+      }
+      case 0x53: push(ro(r.line())); break;
+      case 0x55: pystr(r.bytes(r.u8()), s); break;
+      case 0x54: pystr(r.bytes(r.i32()), s); break;
+      case 0x43: bytesLeaf(r.bytes(r.u8()), s); break;
+      case 0x42: bytesLeaf(r.bytes(r.u32()), s); break;
+      case 0x8e: bytesLeaf(r.bytes(Number(r.u64())), s); break;
+      case 0x96: push(ro(`<bytearray ${r.bytes(Number(r.u64())).length} bytes>`)); break;
+      case 0x29: push(tuple([])); break;
+      case 0x85: case 0x86: case 0x87: push(tuple(stack.splice(-(op - 0x84)))); break;
+      case 0x74: push(tuple(popMark())); break;
+      case 0x5d: push([]); break;
+      case 0x6c: push(popMark()); break;
+      case 0x7d: push(new Map()); break;
+      case 0x64: push(mapFrom(popMark())); break;
+      case 0x8f: { const a = []; a[LABEL] = 'set'; push(a); break; }
+      case 0x91: { const a = popMark(); a[LABEL] = 'frozenset'; push(a); break; }
+      case 0x61: { const v = pop(); append(top(), [v]); break; }
+      case 0x65: case 0x90: { const items = popMark(); append(top(), items); break; }
+      case 0x73: { const v = pop(), k = pop(); setItems(top(), [k, v]); break; }
+      case 0x75: { const kv = popMark(); setItems(top(), kv); break; }
+      case 0x63: { const mod = r.line(), name = r.line(); push(glob(mod, name)); break; }
+      case 0x93: { const name = pop(), mod = pop(); push(glob(mod.v, name.v)); break; }
+      case 0x52: { const args = pop(), f = pop(); push(new PyObj(f, args, 'reduce')); break; }
+      case 0x81: { const args = pop(), c = pop(); push(new PyObj(c, args, 'newobj')); break; }
+      case 0x92: { const kw = pop(), args = pop(), c = pop(), o = new PyObj(c, args, 'newobj'); o.kwargs = kw; push(o); break; }
+      case 0x69: { const mod = r.line(), name = r.line(); push(new PyObj(glob(mod, name), popMark(), 'inst')); break; }
+      case 0x6f: { const a = popMark(), c = a.shift(); push(new PyObj(c, a, 'obj')); break; }
+      case 0x62: { const st = pop(), o = top(); if (o instanceof PyObj) o.state = st; break; }
+      case 0x67: push(get(+r.line())); break;
+      case 0x68: push(get(r.u8())); break;
+      case 0x6a: push(get(r.u32())); break;
+      case 0x70: memo.set(+r.line(), top()); break;
+      case 0x71: memo.set(r.u8(), top()); break;
+      case 0x72: memo.set(r.u32(), top()); break;
+      case 0x94: memo.set(memo.size, top()); break;
+      case 0x50: push(ro(`persistent id ${r.line()}`)); break;
+      case 0x51: pop(); push(ro('persistent id')); break;
+      case 0x82: push(ro(`ext ${r.u8()}`)); break;
+      case 0x83: push(ro(`ext ${r.u16()}`)); break;
+      case 0x84: push(ro(`ext ${r.i32()}`)); break;
+      default: throw Error(`unsupported pickle opcode 0x${op.toString(16)} at byte ${s}`);
+    }
+  }
+  function get(i) { if (!memo.has(i)) throw Error(`pickle memo ${i} missing`); return memo.get(i); }
+}
+
+function pickleDoc(bytes) {
+  const { P, root, frames } = parsePickle(bytes);
+  // FRAME lengths would be wrong after resizing edits; frames are optional, so drop them
+  return { root, save: () => P.save(P.changed.length ? frames.map(off => ({ off, len: 9, bytes: new Uint8Array(0) })) : []) };
+}
+
+FORMATS.push(
+  {
+    id: 'renpy', label: "Ren'Py (.save)", exts: ['save'],
+    test: b => b[0] === 0x50 && b[1] === 0x4b,
+    async open(b) {
+      const zip = await JSZip.loadAsync(b), log = zip.file('log');
+      if (!log) throw Error("zip has no Ren'Py log");
+      const d = pickleDoc(await log.async('uint8array'));
+      const [vars, rest] = Array.isArray(d.root) ? d.root : [d.root];
+      return {
+        root: { variables: vars, log: rest },
+        note: zip.file('signatures') ? "Ren'Py 8.1+ will ask whether to trust this edited save: answer Yes." : '',
+        async save() { zip.file('log', d.save()); return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' }); },
+      };
+    },
+  },
+  {
+    id: 'renpyp', label: "Ren'Py persistent (zlib pickle)", exts: ['persistent'],
+    test: (b, n) => b[0] === 0x78 && /persistent/i.test(n),
+    open(b) { const d = pickleDoc(pako.inflate(b)); return { root: { persistent: d.root }, save: () => pako.deflate(d.save()) }; },
+  },
+  {
+    id: 'pickle', label: 'Python pickle', exts: ['pkl', 'pickle', 'sav', 'dat'],
+    test: (b, n) => b[0] === 0x80 && b[1] <= 5 || ['pkl', 'pickle'].includes(ext(n)),
+    open(b) { const d = pickleDoc(b); return { root: { root: d.root }, save: d.save }; },
+  },
+);

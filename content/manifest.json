@@ -1,0 +1,78 @@
+{
+ "version": "1.0.0",
+ "minShell": "1.0.0",
+ "files": {
+  "css/app.css": {
+   "sha256": "f3914f8257457f3c4d2a70de0d5c0598d019b56b379ee5b34f00463cb2b0b2f8",
+   "size": 13498
+  },
+  "fonts/OFL.txt": {
+   "sha256": "c3c8402eec0e31dc9a76851235b1c02a0bb821488b2db8e35bcc2ab60ca8fc2b",
+   "size": 4503
+  },
+  "fonts/archivo-latin-ext-wdth-normal.woff2": {
+   "sha256": "5717f37059660ca5c899bad6c48ee22c3ac55cb3c484055241689d0f905a1a86",
+   "size": 86240
+  },
+  "fonts/archivo-latin-wdth-normal.woff2": {
+   "sha256": "e3a28eade21a900c7155a247757f4b2834c07bb7ef07ad7efa55cebaac1e8f5e",
+   "size": 90104
+  },
+  "img/mark.svg": {
+   "sha256": "ee9be9cdaf63cabe9386f1b6554a9e115615a0846f9030460fab690a63801e8e",
+   "size": 883
+  },
+  "index.html": {
+   "sha256": "85b95dd9d8830f30a6e22ad30b2c26ce7f6a9ef96344c3d0b3e66ae4e34f3e36",
+   "size": 4879
+  },
+  "js/app.js": {
+   "sha256": "9358f844c7b23b56f902803cbcce742d44527b087a724c08d51e832fce2448fc",
+   "size": 22871
+  },
+  "js/core.js": {
+   "sha256": "1e1a8dd85abf30ff3a72e141e9f2125aa5c928b6602d5042f40ba35b949aa9a4",
+   "size": 5727
+  },
+  "js/formats/gvas.js": {
+   "sha256": "98390622ac05f17d926f578f0fdb3b9e073f59c6a282de5bb778f261d204e71c",
+   "size": 5400
+  },
+  "js/formats/json.js": {
+   "sha256": "582d20463e2f92b2413b2c237c6dcd7b60834f1166d1e8c8bbe23e899608502f",
+   "size": 4472
+  },
+  "js/formats/marshal.js": {
+   "sha256": "df89083f9b9c985ad50ec8a13ecb0ae2b2421026f94f5787859454c5672378c6",
+   "size": 5422
+  },
+  "js/formats/misc.js": {
+   "sha256": "34b173112869a32ed088dd095e1348746a33cafc0baa3b66094b112839be6f8d",
+   "size": 7307
+  },
+  "js/formats/nrbf.js": {
+   "sha256": "68006bc397f6e826ac64fbcefab1cf672361c14b89e646b0f88ce2e2771d4041",
+   "size": 5460
+  },
+  "js/formats/pickle.js": {
+   "sha256": "62721753bb216bfdfb92b2815851cfe80d4a4dd13c5992109a22523896ba7915",
+   "size": 10501
+  },
+  "js/platform.js": {
+   "sha256": "057cbcdf8cc3e3e6560f9c84c29ee6cde2ce696279b27621a5689eb3f510dbc6",
+   "size": 2969
+  },
+  "vendor/jszip.min.js": {
+   "sha256": "acc7e41455a80765b5fd9c7ee1b8078a6d160bbbca455aeae854de65c947d59e",
+   "size": 97630
+  },
+  "vendor/lz-string.min.js": {
+   "sha256": "95f4d1cbf099f57161b664bc048426ec3df92637801a4c79116e83315aa787e7",
+   "size": 4814
+  },
+  "vendor/pako.min.js": {
+   "sha256": "ede2693a4a6a5126b9d35669062b358ecab6ae7b9b86a1cf302feb45a8514907",
+   "size": 46859
+  }
+ }
+}

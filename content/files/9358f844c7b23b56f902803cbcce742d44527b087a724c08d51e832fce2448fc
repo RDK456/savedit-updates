@@ -1,0 +1,393 @@
+// UI: contents list | chapter page (field table) | thumb tabs, search, changes, save, updates.
+const $ = id => document.getElementById(id);
+const SECTION = ['#1f5fbf', '#23803f', '#a55a08', '#6b3fa0', '#0f7272'];
+const PAGE = 200;
+
+let file = null, doc = null, fmt = null, unsaved = false;
+let chain = [];            // [{label, node}] from the root to the current page
+let view = 'start';        // start | page | search | changes
+let lastPage = null;
+const edits = new Map();   // edit id -> {where, orig, get, set, t}
+
+// ---- small DOM helpers (all save data goes in as text, never HTML) ----
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e[k] = v;
+    else if (k === 'style') e.style.cssText = v;
+    else if (k in e && typeof v !== 'string') e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c != null && c !== false) e.append(c instanceof Node ? c : String(c));
+  return e;
+}
+function icon(name) {
+  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  s.setAttribute('class', 'i'); s.setAttribute('aria-hidden', 'true');
+  const u = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  u.setAttribute('href', '#i-' + name); s.append(u);
+  return s;
+}
+const isContainer = v => v !== null && typeof v === 'object' && !v[LEAF];
+const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? '' : 's'}`;
+const sizeText = n => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+const TYPE = { int: 'Whole number', num: 'Number', float: 'Decimal', str: 'Text', bool: 'On / off', hex: 'Bytes (hex)', ro: 'Read-only' };
+
+function banner(msg) { $('bannerText').textContent = msg; $('banner').hidden = !msg; }
+function message(msg) { $('stMsg').textContent = msg || ''; }
+$('bannerClose').onclick = () => banner('');
+
+// ---- opening ----
+for (const f of FORMATS) $('fmt').append(el('option', { value: f.id }, f.label));
+const ctx = { ask: async msg => prompt(msg) };
+
+async function openFile(f, err) {
+  if (err || !f) { if (err) banner(`Could not open the file: ${err.message || err}`); return; }
+  if (unsaved && !confirm('You have unsaved changes. Open another file and lose them?')) return;
+  file = f; $('fmt').value = '';
+  await parseFile('');
+}
+
+async function parseFile(forced) {
+  const bytes = file.bytes, name = file.name;
+  const order = forced ? [FORMATS.find(f => f.id === forced)]
+    : FORMATS.filter(f => { try { return f.test(bytes, name); } catch { return false; } }).concat(FORMATS.find(f => f.id === 'raw'));
+  let error;
+  doc = null;
+  for (const f of order) {
+    try { doc = await f.open(bytes, name, ctx); fmt = f; break; } catch (e) { error = e; }
+  }
+  edits.clear(); unsaved = false; chain = []; $('search').value = ''; banner('');
+  if (!doc) { view = 'start'; banner(`“${name}” could not be read as ${forced ? order[0].label : 'any supported format'}: ${error?.message}`); return renderAll(); }
+  view = 'page';
+  message(fmt.id === 'raw' ? 'Unknown format: search for a number from the game.' : '');
+  renderAll();
+}
+
+// ---- saving ----
+async function save(asCopy) {
+  if (!doc) return;
+  try {
+    const out = await doc.save();
+    if (asCopy) {
+      const r = await platform.saveAs(file, out);
+      if (!r) return;
+      if (r.path) Object.assign(file, { path: r.path, name: r.name });
+      message(r.message);
+    } else message(await platform.save(file, out));
+    file.bytes = out instanceof Uint8Array ? out : new Uint8Array(out);
+    unsaved = false; banner('');
+    renderStatus();
+  } catch (e) { banner(`Save failed: ${e.message || e}. The original file was not changed.`); }
+}
+
+// ---- edits ----
+const keys = new WeakMap();
+function editId(holder, key, box) {
+  if (box) return box;
+  if (!keys.has(holder)) keys.set(holder, new Map());
+  const m = keys.get(holder);
+  if (!m.has(key)) m.set(key, {});
+  return m.get(key);
+}
+function parseValue(cur, t, s) {
+  if (t === 'int') {
+    if (!/^\s*-?\d+\s*$/.test(s)) throw Error('Use a whole number, like 1500');
+    const n = BigInt(s.trim());
+    if (cur.min != null && n < BigInt(cur.min)) throw Error(`The lowest allowed is ${cur.min}`);
+    if (cur.max != null && n > BigInt(cur.max)) throw Error(`The highest allowed is ${cur.max}`);
+    return typeof cur.v === 'bigint' || !Number.isSafeInteger(Number(n)) ? n : Number(n);
+  }
+  if (t === 'float' || t === 'num') {
+    const n = Number(s);
+    if (!s.trim() || (Number.isNaN(n) && !/^\s*nan\s*$/i.test(s))) throw Error('Use a number, like 2.5');
+    return n;
+  }
+  if (t === 'hex') return hex(unhex(s));
+  if (cur.max != null && [...s].length > cur.max) throw Error(`At most ${cur.max} character${cur.max === 1 ? '' : 's'}`);
+  return s;
+}
+
+// one field row: name | value editor | type | revert
+function fieldRow(label, holder, key, where, loc) {
+  const v = holder[key], box = isBox(v) ? v : null;
+  const t = box ? box.t : typeof v === 'number' ? 'num' : typeof v === 'boolean' ? 'bool' : v === null ? 'ro' : 'str';
+  const get = () => box ? box.v : holder[key];
+  const set = x => { if (box) box.v = x; else holder[key] = x; };
+  const id = editId(holder, key, box);
+  const tr = el('tr');
+  const cell = el('td');
+  const valWrap = el('div', { class: 'val' });
+  const err = el('div', { class: 'err', hidden: true });
+  const act = el('td', { class: 'act' });
+
+  const sync = () => {
+    const e = edits.get(id);
+    tr.classList.toggle('changed', !!e);
+    act.replaceChildren(e ? el('button', { class: 'undo', title: `Change back to ${display(e.orig)}`, onclick: () => { revert(id); refresh(); } }, icon('undo'), 'Undo') : '');
+  };
+  const commit = nv => {
+    const e = edits.get(id), orig = e ? e.orig : get();
+    set(nv);
+    if (nv === orig) edits.delete(id); else edits.set(id, { where, orig, get, set, t, label });
+    unsaved = true;
+    sync(); renderStatus(); renderTabs();
+  };
+  const fail = (input, m) => { tr.classList.add('invalid'); input.setAttribute('aria-invalid', 'true'); err.replaceChildren(icon('alert'), m); err.hidden = false; };
+  const ok = input => { tr.classList.remove('invalid'); input.removeAttribute('aria-invalid'); err.hidden = true; };
+
+  let input;
+  if (t === 'bool') {
+    input = el('input', { type: 'checkbox', class: 'check', checked: !!get(), 'aria-label': label, onchange: () => commit(input.checked) });
+  } else if (t === 'ro') {
+    input = el('span', { class: 'ro' }, v === null ? 'empty' : String(box.v));
+  } else {
+    const text = String(get());
+    input = text.includes('\n')
+      ? el('textarea', { 'aria-label': label, spellcheck: 'false' }, text)
+      : el('input', { type: 'text', class: t === 'hex' ? 'hex' : null, value: text, 'aria-label': label, spellcheck: 'false', inputmode: ['int', 'num', 'float'].includes(t) ? 'decimal' : null });
+    input.onchange = () => {
+      try { const nv = parseValue(box || { v: get() }, t, input.value); ok(input); commit(nv); }
+      catch (e) { fail(input, e.message); }
+    };
+    input.onkeydown = e => { if (e.key === 'Escape') { input.value = String(get()); ok(input); } };
+  }
+  valWrap.append(input, err);
+  cell.append(valWrap);
+  tr.append(el('td', { class: 'name' }, label, loc ? el('span', { class: 'loc' }, loc) : null), cell,
+    el('td', { class: 'type' }, TYPE[t] || t), act);
+  sync();
+  return tr;
+}
+const display = v => typeof v === 'boolean' ? (v ? 'on' : 'off') : v === '' ? '(empty)' : String(v);
+function revert(id) { const e = edits.get(id); if (!e) return; e.set(e.orig); edits.delete(id); unsaved = edits.size > 0 || unsaved; }
+
+// ---- pages ----
+function sectionColor(c = chain) {
+  if (!c.length) return 'var(--ink)';
+  const tops = kidsOf(doc.root).filter(([, h, k]) => isContainer(h[k]));
+  const i = tops.findIndex(([, h, k]) => h[k] === c[0].node);
+  return SECTION[(i < 0 ? 0 : i) % SECTION.length];
+}
+function band(title, meta, color) {
+  document.documentElement.style.setProperty('--sec', color);
+  return el('header', { class: 'band' }, el('h1', {}, title), el('div', { class: 'meta' }, meta));
+}
+function crumbs() {
+  const parts = [el('button', { onclick: () => go([]) }, file.name)];
+  chain.slice(0, -1).forEach((c, i) => parts.push(icon('right'), el('button', { onclick: () => go(chain.slice(0, i + 1)) }, c.label)));
+  return el('nav', { class: 'crumbs', 'aria-label': 'Location' }, parts);
+}
+const countText = node => { const n = kidsOf(node).length; return Array.isArray(node) ? `${n.toLocaleString()} ${n === 1 ? 'entry' : 'entries'}` : plural(n, 'field'); };
+const kindText = node => (node[LABEL] ? `${node[LABEL]} · ` : '') + countText(node);
+
+function tip(text) { return el('aside', { class: 'tip' }, el('b', {}, 'Tip'), el('p', {}, text)); }
+
+const COLS = { Field: 'c-name', 'Game engine': 'c-name', Type: 'c-type', '': 'c-act' };
+const thead = head => el('thead', {}, el('tr', {}, head.map(h => el('th', { scope: 'col', class: COLS[h] }, h))));
+function table(head, rows) { return el('table', {}, thead(head), el('tbody', {}, rows)); }
+
+function pageView() {
+  const node = chain.length ? chain[chain.length - 1].node : doc.root;
+  const title = chain.length ? chain[chain.length - 1].label : file.name;
+  const kids = kidsOf(node);
+  const sheet = el('div', { class: 'sheet' });
+  if (!chain.length && doc.note) sheet.append(tip(doc.note));
+  if (!chain.length && !doc.note) sheet.append(tip('Search for a number you can see in the game, like your gold. Change it, save, then reload the save in the game.'));
+  const tbody = el('tbody');
+  let shown = 0;
+  const more = el('div', { class: 'pager' });
+  const addRows = () => {
+    for (const [label, h, k] of kids.slice(shown, shown + PAGE)) {
+      const v = h[k];
+      tbody.append(isContainer(v)
+        ? el('tr', {}, el('td', { class: 'name' }, label), el('td', {}, el('button', { class: 'link', onclick: () => go([...chain, { label, node: v }]) }, `Open ${countText(v)}`, icon('right'))),
+          el('td', { class: 'type' }, v[LABEL] || (Array.isArray(v) ? 'List' : 'Group')), el('td', { class: 'act' }))
+        : fieldRow(label, h, k, [...chain.map(c => c.label), label].join(' › ')));
+    }
+    shown = Math.min(kids.length, shown + PAGE);
+    more.replaceChildren(shown < kids.length ? el('button', { class: 'btn dark', onclick: addRows }, `Show ${Math.min(PAGE, kids.length - shown)} more of ${kids.length.toLocaleString()}`) : '');
+  };
+  addRows();
+  sheet.append(kids.length
+    ? el('table', {}, thead(['Field', 'Value', 'Type', '']), tbody)
+    : el('div', { class: 'empty' }, el('h2', {}, 'Nothing in here'), el('p', {}, 'This group is empty in the save.')), more);
+  return [band(title, [chain.length ? crumbs() : el('span', {}, fmt.label), el('span', {}, kindText(node))], sectionColor()), sheet];
+}
+
+function searchView(q) {
+  const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const hits = [];
+  if (doc.search) hits.push(...doc.search(q).map(([l, h, k]) => ({ label: l, h, k, at: [] })));
+  else {
+    const seen = new Set(); let budget = 3e6;
+    (function walk(n, at) {
+      for (const [l, h, k] of kidsOf(n)) {
+        if (hits.length >= 500 || --budget < 0) return;
+        const v = h[k];
+        if (isContainer(v)) { if (!seen.has(v)) { seen.add(v); walk(v, [...at, { label: l, node: v }]); } continue; }
+        const val = isBox(v) ? v.v : v, path = [...at.map(a => a.label), l].join(' ');
+        if (terms.every(t => `${path} ${val}`.toLowerCase().includes(t))) hits.push({ label: l, h, k, at });
+      }
+    })(doc.root, []);
+  }
+  $('hits').textContent = hits.length >= 500 ? '500+ matches' : `${hits.length} ${hits.length === 1 ? 'match' : 'matches'}`;
+  const sheet = el('div', { class: 'sheet' });
+  if (!hits.length) sheet.append(el('div', { class: 'empty' }, el('h2', {}, `No matches for “${q}”`),
+    el('p', {}, 'Check the number on screen, or search part of a name instead, like gold or hp.')));
+  else {
+    if (hits.length >= 500) sheet.append(tip('Showing the first 500 matches. Add another word or the exact number to narrow it down.'));
+    sheet.append(table(['Field', 'Value', 'Type', ''], hits.map(x => {
+      const row = fieldRow(x.label, x.h, x.k, [...x.at.map(a => a.label), x.label].join(' › '), x.at.map(a => a.label).join(' › ') || null);
+      if (x.at.length) {
+        const loc = row.querySelector('.loc');
+        loc.replaceChildren(el('button', { class: 'link', style: 'font-weight:400;font-size:12.5px', onclick: () => { $('search').value = ''; go(x.at); } }, x.at.map(a => a.label).join(' › ')));
+      }
+      return row;
+    })));
+  }
+  return [band(`“${q}”`, [el('span', {}, `Search in ${file.name}`), el('span', {}, $('hits').textContent)], 'var(--ink)'), sheet];
+}
+
+function changesView() {
+  const sheet = el('div', { class: 'sheet' });
+  if (doc.note) sheet.append(tip(doc.note));
+  if (!edits.size) sheet.append(el('div', { class: 'empty' }, el('h2', {}, 'No changes yet'), el('p', {}, 'Values you change show up here, with a way to undo each one.')));
+  else sheet.append(table(['Field', 'Was', 'Now', ''], [...edits].map(([id, e]) => el('tr', { class: 'changed' },
+    el('td', { class: 'name' }, e.label, el('span', { class: 'loc' }, e.where)),
+    el('td', { class: 'was' }, display(e.orig)), el('td', {}, el('strong', {}, display(e.get()))),
+    el('td', { class: 'act' }, el('button', { class: 'undo', onclick: () => { revert(id); refresh(); } }, icon('undo'), 'Undo'))))));
+  return [band('Changes', [el('span', {}, plural(edits.size, 'change')), el('span', {}, unsaved ? 'Not saved yet' : 'Saved')], 'var(--red)'), sheet];
+}
+
+function startView() {
+  document.documentElement.style.setProperty('--sec', 'var(--ink)');
+  const rows = [
+    ['RPG Maker MV / MZ', '.rpgsave, .rmmzsave'], ['RPG Maker XP / VX / VX Ace', '.rxdata, .rvdata, .rvdata2'], ["Ren'Py", '.save, persistent'],
+    ['Unity', '.dat, .data, .es3'], ['Unreal Engine', '.sav'], ['Naninovel', '.nson'], ['TyranoScript', '.sav'],
+    ['Twine SugarCube', '.save'], ['QSP', '.sav'], ['Pokémon Gen 3 (GBA)', '.sav, .srm'], ['Any game: JSON', '.json'], ['Anything else', 'number search'],
+  ];
+  return [
+    el('header', { class: 'band' }, el('h1', {}, 'Open a save file'), el('div', { class: 'meta' }, 'Everything stays on this computer.')),
+    el('div', { class: 'start' },
+      el('section', { class: 'dropzone' }, el('h2', {}, 'Drop a save here'),
+        el('p', {}, platform.desktop
+          ? 'Or open one from the game’s save folder. When you save, the untouched original is kept next to it as a .bak file.'
+          : 'Or open one from the game’s save folder. Saving downloads the edited copy; keep the original somewhere safe.'),
+        el('button', { class: 'btn primary', onclick: async () => openFile(await platform.open()) }, icon('open'), 'Open a save')),
+      el('section', { class: 'formats' }, table(['Game engine', 'Files'], rows.map(([a, b]) => el('tr', {}, el('td', { class: 'name' }, a), el('td', {}, b)))))),
+  ];
+}
+
+// ---- contents (left) and thumb tabs (right) ----
+function tocList(node, at, depth) {
+  const ol = el('ol');
+  const kids = kidsOf(node).filter(([, h, k]) => isContainer(h[k]));
+  for (const [label, h, k] of kids.slice(0, 300)) {
+    const v = h[k], here = [...at, { label, node: v }];
+    const current = view === 'page' && chain.length === here.length && chain.every((c, i) => c.node === here[i].node && c.label === here[i].label);
+    const open = chain.length > here.length && here.every((c, i) => chain[i]?.node === c.node && chain[i]?.label === c.label);
+    const hasKids = depth < 6 && kidsOf(v).some(([, hh, kk]) => isContainer(hh[kk]));
+    const li = el('li');
+    const sub = el('div', { hidden: !open });
+    const tw = hasKids ? el('button', { class: 'tw', 'aria-expanded': String(open), 'aria-label': `Show inside ${label}`,
+      onclick: e => { e.stopPropagation(); const x = tw.getAttribute('aria-expanded') !== 'true'; tw.setAttribute('aria-expanded', String(x)); if (x && !sub.childElementCount) sub.append(tocList(v, here, depth + 1)); sub.hidden = !x; } }, icon('right')) : el('span', { class: 'tw' });
+    if (open) sub.append(tocList(v, here, depth + 1));
+    li.append(el('div', { style: 'display:flex' }, tw, el('button', { class: 'item', 'aria-current': current ? 'page' : null, onclick: () => { $('search').value = ''; go(here); } },
+      depth === 0 ? el('span', { class: 'sq', style: `background:${sectionColor(here)}` }) : null,
+      el('span', { class: 'name' }, label), el('span', { class: 'lead' }), el('span', { class: 'count' }, kidsOf(v).length.toLocaleString()))), sub);
+    ol.append(li);
+  }
+  if (kids.length > 300) ol.append(el('li', { class: 'more' }, `${kids.length - 300} more on the page`));
+  return ol;
+}
+function renderToc() {
+  const toc = $('toc');
+  toc.replaceChildren();
+  if (!doc) return toc.append(el('li', { class: 'more' }, 'Open a save to see what is inside.'));
+  toc.append(el('li', {}, el('div', { style: 'display:flex' }, el('span', { class: 'tw' }),
+    el('button', { class: 'item', 'aria-current': view === 'page' && !chain.length ? 'page' : null, onclick: () => { $('search').value = ''; go([]); } },
+      el('span', { class: 'name' }, 'Overview'), el('span', { class: 'lead' }), el('span', { class: 'count' }, kidsOf(doc.root).length.toLocaleString())))));
+  toc.append(...tocList(doc.root, [], 0).children);
+}
+function renderTabs() {
+  const tabs = $('tabs');
+  tabs.replaceChildren();
+  if (!doc) return;
+  kidsOf(doc.root).filter(([, h, k]) => isContainer(h[k])).slice(0, 12).forEach(([label, h, k]) => {
+    const here = [{ label, node: h[k] }];
+    tabs.append(el('button', { class: 'tab', title: label, style: `--sec:${sectionColor(here)}`, 'aria-current': String(view === 'page' && chain[0]?.node === h[k]),
+      onclick: () => { $('search').value = ''; go(here); } }, label));
+  });
+  tabs.append(el('button', { class: 'tab changes', 'aria-current': String(view === 'changes'), disabled: !edits.size && view !== 'changes',
+    onclick: () => { view = 'changes'; renderPage(); renderTabs(); renderToc(); } }, edits.size ? `Changes · ${edits.size}` : 'Changes'));
+}
+
+// ---- status ----
+function renderStatus() {
+  $('stFile').textContent = file ? `${file.name} · ${sizeText(file.bytes.length)}` : 'No file open';
+  $('fmtWrap').hidden = !doc && !file;
+  if (doc && !$('fmt').value) $('fmt').title = `Detected: ${fmt.label}`;
+  const c = $('stChanges');
+  c.textContent = !doc ? '' : unsaved ? `${plural(edits.size, 'change')} not saved` : edits.size ? 'All changes saved' : '';
+  c.classList.toggle('dirty', unsaved);
+  $('save').disabled = !doc || !unsaved;
+  $('saveAs').disabled = !doc;
+  $('search').disabled = !doc;
+}
+
+function renderPage() {
+  const page = $('page');
+  const q = $('search').value.trim();
+  if (doc && q) view = 'search';
+  else if (view === 'search') view = 'page';
+  if (view !== 'search') $('hits').textContent = '';
+  page.replaceChildren(...(view === 'start' || !doc ? startView() : view === 'search' ? searchView(q) : view === 'changes' ? changesView() : pageView()));
+}
+function renderAll() { renderPage(); renderToc(); renderTabs(); renderStatus(); }
+function refresh() { const top = $('page').scrollTop; renderAll(); $('page').scrollTop = top; }
+function go(c) { chain = c; view = 'page'; renderAll(); $('page').scrollTop = 0; $('page').focus({ preventScroll: true }); }
+
+// ---- updates (desktop only) ----
+async function updates() {
+  const u = platform.update, st = $('stUpdate');
+  if (!u) return;
+  const show = (...kids) => st.replaceChildren(...kids);
+  let info;
+  try { info = await u.check(); } catch (e) { show(el('span', { title: String(e) }, 'Could not check for updates'), el('button', { onclick: updates }, 'Retry')); return; }
+  if (!info.configured || !info.available) return show(el('span', {}, `Version ${info.current}${info.configured ? ' · up to date' : ''}`));
+  if (info.needsShell) return show(el('span', {}, `Version ${info.latest} needs a full app update`),
+    el('button', { onclick: async () => { show(el('span', {}, 'Downloading the app update…')); try { await u.shell(); } catch (e) { show(el('span', {}, `Update failed: ${e}`)); } } }, 'Install'));
+  show(el('span', {}, `Update ${info.latest} · ${plural(info.changedFiles, 'file')}, ${sizeText(info.downloadBytes)}`),
+    el('button', { onclick: async () => {
+      const stop = await u.onProgress((d, t) => show(el('span', {}, `Downloading ${d} of ${t}…`)));
+      try {
+        await u.apply(); stop?.();
+        show(el('span', {}, `Updated to ${info.latest}`), el('button', { onclick: () => { if (!unsaved || confirm('Restarting loses unsaved changes. Restart anyway?')) location.reload(); } }, 'Restart now'));
+      } catch (e) { stop?.(); show(el('span', {}, `Update failed: ${e}`), el('button', { onclick: updates }, 'Retry')); }
+    } }, 'Install'));
+}
+
+// ---- wiring ----
+$('open').onclick = async () => { try { openFile(await platform.open()); } catch (e) { banner(`Could not open the file: ${e.message || e}`); } };
+$('save').onclick = () => save(false);
+$('saveAs').onclick = () => save(true);
+$('fmt').onchange = () => { if (file && (!unsaved || confirm('Read the file again with this format and lose your changes?'))) parseFile($('fmt').value); };
+let timer;
+$('search').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { renderPage(); renderTabs(); renderToc(); }, 220); };
+$('findForm').onsubmit = e => { e.preventDefault(); clearTimeout(timer); renderPage(); $('page').querySelector('tbody input, tbody .check')?.focus(); };
+$('search').onkeydown = e => { if (e.key === 'Escape') { $('search').value = ''; renderAll(); } };
+addEventListener('keydown', e => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); $('open').click(); }
+  else if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); if (doc) save(e.shiftKey); }
+  else if (mod && e.key.toLowerCase() === 'f' && doc) { e.preventDefault(); $('search').focus(); $('search').select(); }
+});
+addEventListener('beforeunload', e => { if (unsaved) e.preventDefault(); });
+platform.onDrop(openFile, on => { $('drop').hidden = !on; });
+
+renderAll();
+platform.startup().then(p => p && platform.read(p)).then(f => f && openFile(f)).catch(e => banner(`Could not open the file: ${e.message || e}`));
+setTimeout(updates, 1500);

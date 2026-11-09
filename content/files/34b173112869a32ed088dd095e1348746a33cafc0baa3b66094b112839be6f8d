@@ -1,0 +1,129 @@
+// QSP, Pokémon Gen 3 (GBA), and a raw binary value scanner (Wolf RPG and anything else).
+const acc = (t, get, set, extra) => Object.defineProperty({ [LEAF]: true, t, ...extra }, 'v', { enumerable: true, get, set });
+
+// ---- QSP: lines joined by CRLF; after the 2 header lines every char is shifted by 5
+const QSP_HEAD = 'QSPSAVEDGAME';
+const qspMap = f => s => { let o = ''; for (let i = 0; i < s.length; i++) o += String.fromCharCode(f(s.charCodeAt(i))); return o; };
+const qspCode = qspMap(x => x === 5 ? 0xfffb : (x - 5) & 0xffff);
+const qspDecode = qspMap(x => x === 0xfffb ? 5 : (x + 5) & 0xffff);
+function qspText(b) {
+  if (b[0] === 0xff && b[1] === 0xfe) return ['bom', new TextDecoder('utf-16le').decode(b.subarray(2))];
+  if (b[1] === 0) return ['u16', new TextDecoder('utf-16le').decode(b)];
+  return ['ansi', latin1(b)]; // shortcut: ANSI (cp1251) saves show non-ASCII text garbled, bytes still round-trip
+}
+
+FORMATS.push({
+  id: 'qsp', label: 'QSP (Quest Soft Player .sav)', exts: ['sav'],
+  test: b => { const t = qspText(b.subarray(0, 64))[1]; return t.startsWith(QSP_HEAD) || qspDecode(t.slice(0, 12)) === QSP_HEAD; },
+  open(b) {
+    const [enc, text] = qspText(b), lines = text.split('\r\n');
+    const plainHead = lines[0].startsWith(QSP_HEAD);
+    if (!plainHead && !qspDecode(lines[0]).startsWith(QSP_HEAD)) throw Error('not a QSP save');
+    const coded = i => !plainHead || i >= 2;
+    const root = lines.map((l, i) => ({ [LEAF]: true, t: 'str', v: coded(i) ? qspDecode(l) : l }));
+    return {
+      root,
+      save() {
+        const out = root.map((x, i) => coded(i) ? qspCode(x.v) : x.v).join('\r\n');
+        if (enc === 'ansi') return fromLatin1(out);
+        const u = new Uint8Array(out.length * 2 + (enc === 'bom' ? 2 : 0)), dv = new DataView(u.buffer);
+        let o = 0; if (enc === 'bom') { dv.setUint16(0, 0xfeff, true); o = 2; }
+        for (let i = 0; i < out.length; i++) dv.setUint16(o + i * 2, out.charCodeAt(i), true);
+        return u;
+      },
+    };
+  },
+});
+
+// ---- Pokémon Ruby/Sapphire/Emerald/FireRed/LeafGreen
+const G3_SIG = 0x08012025;
+const G3_LAYOUT = {
+  RS: { money: 0x490, coins: 0x494, 'PC items': [0x498, 50], Items: [0x560, 20], 'Key items': [0x5b0, 20], 'Poké Balls': [0x600, 16], 'TMs & HMs': [0x640, 64], Berries: [0x740, 46] },
+  E: { money: 0x490, coins: 0x494, 'PC items': [0x498, 50], Items: [0x560, 30], 'Key items': [0x5d8, 30], 'Poké Balls': [0x650, 16], 'TMs & HMs': [0x690, 64], Berries: [0x790, 46] },
+  FRLG: { money: 0x290, coins: 0x294, 'PC items': [0x298, 30], Items: [0x310, 42], 'Key items': [0x3b8, 30], 'Poké Balls': [0x430, 13], 'TMs & HMs': [0x464, 58], Berries: [0x54c, 43] },
+};
+const g3Text = bytes => Array.from(bytes).map(c => c === 0 ? ' ' : c >= 0xbb && c <= 0xd4 ? String.fromCharCode(65 + c - 0xbb) : c >= 0xd5 && c <= 0xee ? String.fromCharCode(97 + c - 0xd5) : c >= 0xa1 && c <= 0xaa ? String(c - 0xa1) : c === 0xff ? '\0' : '?').join('').split('\0')[0];
+
+FORMATS.push({
+  id: 'gen3', label: 'Pokémon Gen 3 (GBA .sav / .srm)', exts: ['sav', 'srm', 'sa1'],
+  test: b => b.length >= 0x1c000 && new DataView(b.buffer, b.byteOffset).getUint32(0xff8, true) === G3_SIG,
+  open(src) {
+    const b = src.slice(), dv = new DataView(b.buffer);
+    const block = base => {
+      const secs = {}; let idx = 0;
+      for (let i = 0; i < 14; i++) {
+        const o = base + i * 0x1000;
+        if (o + 0x1000 > b.length || dv.getUint32(o + 0xff8, true) !== G3_SIG) return null;
+        secs[dv.getUint16(o + 0xff4, true)] = o; idx = dv.getUint32(o + 0xffc, true);
+      }
+      return { secs, idx };
+    };
+    const A = block(0), B = block(0xe000), act = !B || (A && A.idx >= B.idx) ? A : B;
+    if (!act || act.secs[0] == null || act.secs[1] == null) throw Error('no valid Gen 3 save block');
+    const s0 = act.secs[0], s1 = act.secs[1], code = dv.getUint32(s0 + 0xac, true);
+    const game = code === 0 ? 'RS' : code === 1 ? 'FRLG' : 'E';
+    const key = game === 'RS' ? 0 : game === 'E' ? code : dv.getUint32(s0 + 0xf20, true), key16 = key & 0xffff;
+    const L = G3_LAYOUT[game];
+    const xor = (o, bits, k, max) => bits === 32
+      ? acc('int', () => (dv.getUint32(o, true) ^ k) >>> 0, x => dv.setUint32(o, (x ^ k) >>> 0, true), { min: 0, max })
+      : acc('int', () => (dv.getUint16(o, true) ^ k) & 0xffff, x => dv.setUint16(o, (x ^ k) & 0xffff, true), { min: 0, max });
+    const pocket = (name) => {
+      const [off, n] = L[name], k = name === 'PC items' ? 0 : key16;
+      return Array.from({ length: n }, (_, i) => {
+        const o = s1 + off + i * 4;
+        return { 'item id': dvBox(dv, o, 'u16'), quantity: xor(o + 2, 16, k, 999) };
+      });
+    };
+    const root = {
+      game: ro({ RS: 'Ruby / Sapphire', E: 'Emerald', FRLG: 'FireRed / LeafGreen' }[game]),
+      trainer: {
+        name: ro(g3Text(b.subarray(s0, s0 + 7))),
+        'trainer id': dvBox(dv, s0 + 0xa, 'u16'), 'secret id': dvBox(dv, s0 + 0xc, 'u16'),
+        'play time': { hours: dvBox(dv, s0 + 0xe, 'u16', { max: 999 }), minutes: dvBox(dv, s0 + 0x10, 'u8', { max: 59 }), seconds: dvBox(dv, s0 + 0x11, 'u8', { max: 59 }) },
+      },
+      money: xor(s1 + L.money, 32, key, 999999),
+      coins: xor(s1 + L.coins, 16, key16, 9999),
+      bag: Object.fromEntries(['Items', 'Key items', 'Poké Balls', 'TMs & HMs', 'Berries'].map(p => [p, pocket(p)])),
+      'PC items': pocket('PC items'),
+    };
+    return {
+      root,
+      note: 'Party and PC Pokémon are not editable yet.',
+      save() {
+        for (const [id, o] of Object.entries(act.secs)) {
+          const size = { 0: 3884, 4: 3848, 13: 2000 }[id] ?? 3968;
+          let sum = 0; for (let i = 0; i < size; i += 4) sum = (sum + dv.getUint32(o + i, true)) >>> 0;
+          dv.setUint16(o + 0xff6, ((sum >>> 16) + (sum & 0xffff)) & 0xffff, true);
+        }
+        return b.slice();
+      },
+    };
+  },
+});
+
+// ---- Raw binary: find a number, edit it in place
+FORMATS.push({
+  id: 'raw', label: 'Binary value search (Wolf RPG, any game)', exts: [],
+  test: () => false,
+  open(src, name) {
+    const b = src.slice(), dv = new DataView(b.buffer);
+    return {
+      root: { file: ro(name), size: ro(`${b.length} bytes`), 'how to': ro('Type a number you see in the game (e.g. your gold) in the search box.') },
+      note: 'Unknown layout: search a value, change it, try it in game. Encrypted saves (newer Wolf RPG) cannot be read.',
+      search(q) {
+        const x = Number(q.trim().split(/\s+/).find(t => !isNaN(Number(t))));
+        if (!Number.isFinite(x)) return [];
+        const hits = [];
+        const scan = (kind, n, eq) => { for (let o = 0; o + n <= b.length && hits.length < 500; o++) if (eq(o)) hits.push([`0x${o.toString(16).padStart(6, '0')} ${kind}`, { v: dvBox(dv, o, kind) }, 'v']); };
+        if (Number.isInteger(x)) {
+          if (x >= -(2 ** 31) && x < 2 ** 32) scan(x < 0 ? 'i32' : 'u32', 4, o => (x < 0 ? dv.getInt32(o, true) : dv.getUint32(o, true)) === x);
+          if (x >= -32768 && x < 65536) scan(x < 0 ? 'i16' : 'u16', 2, o => (x < 0 ? dv.getInt16(o, true) : dv.getUint16(o, true)) === x);
+        }
+        scan('f32', 4, o => Math.abs(dv.getFloat32(o, true) - x) < 1e-4 * Math.max(1, Math.abs(x)));
+        scan('f64', 8, o => dv.getFloat64(o, true) === x);
+        return hits;
+      },
+      save: () => b.slice(),
+    };
+  },
+});

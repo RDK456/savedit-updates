@@ -1,0 +1,102 @@
+// Shared model + byte helpers. Formats register themselves in FORMATS.
+// Model: plain JSON values, Arrays, Maps, objects (label via LABEL), custom
+// containers (children via KIDS), and editable leaves ("boxes") marked with LEAF.
+const LEAF = Symbol('leaf'), KIDS = Symbol('kids'), LABEL = Symbol('label');
+const FORMATS = [];
+const te8 = new TextEncoder();
+const td8 = new TextDecoder();
+
+const latin1 = b => { let s = ''; for (let i = 0; i < b.length; i += 8192) s += String.fromCharCode.apply(null, b.subarray(i, i + 8192)); return s; };
+const fromLatin1 = s => Uint8Array.from(s, c => c.charCodeAt(0) & 0xff);
+const utf8Strict = b => new TextDecoder('utf-8', { fatal: true }).decode(b);
+const hex = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join(' ');
+const unhex = s => { const h = s.replace(/\s+/g, ''); if (!/^([0-9a-f]{2})*$/i.test(h)) throw Error('invalid hex'); return Uint8Array.from(h.match(/../g) || [], x => parseInt(x, 16)); };
+const concat = parts => { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; };
+const isBox = v => v !== null && typeof v === 'object' && v[LEAF];
+const ro = (v, extra) => ({ [LEAF]: true, t: 'ro', v: String(v), ...extra });
+
+// little writer for token encoders
+function W() {
+  const a = [];
+  return {
+    u8(...v) { a.push(...v.map(x => x & 0xff)); return this; },
+    bytes(b) { for (const x of b) a.push(x); return this; },
+    num(kind, v, le = true) { const dv = new DataView(new ArrayBuffer(8)); dv['set' + kind](0, v, le); a.push(...new Uint8Array(dv.buffer, 0, { Int8: 1, Uint8: 1, Int16: 2, Uint16: 2, Int32: 4, Uint32: 4, Float32: 4, Float64: 8, BigInt64: 8, BigUint64: 8 }[kind])); return this; },
+    get out() { return Uint8Array.from(a); },
+  };
+}
+
+class Rd {
+  constructor(b, o = 0) { this.b = b; this.dv = new DataView(b.buffer, b.byteOffset, b.byteLength); this.o = o; }
+  get eof() { return this.o >= this.b.length; }
+  need(n) { if (n < 0 || this.o + n > this.b.length) throw Error(`unexpected end of data at ${this.o}`); }
+  num(kind, n, le = true) { this.need(n); const v = this.dv['get' + kind](this.o, le); this.o += n; return v; }
+  u8() { return this.num('Uint8', 1); } i8() { return this.num('Int8', 1); }
+  u16(le) { return this.num('Uint16', 2, le); } i16(le) { return this.num('Int16', 2, le); }
+  u32(le) { return this.num('Uint32', 4, le); } i32(le) { return this.num('Int32', 4, le); }
+  i64(le) { return this.num('BigInt64', 8, le); } u64(le) { return this.num('BigUint64', 8, le); }
+  f32(le) { return this.num('Float32', 4, le); } f64(le) { return this.num('Float64', 8, le); }
+  bytes(n) { this.need(n); return this.b.subarray(this.o, this.o += n); }
+  line() { const i = this.b.indexOf(10, this.o); if (i < 0) throw Error('missing newline'); const s = latin1(this.b.subarray(this.o, i)); this.o = i + 1; return s; }
+}
+
+// Fixed-width numeric box kinds: [DataView kind, bytes, min, max]
+const NUM = {
+  i8: ['Int8', 1, -128, 127], u8: ['Uint8', 1, 0, 255],
+  i16: ['Int16', 2, -32768, 32767], u16: ['Uint16', 2, 0, 65535],
+  i32: ['Int32', 4, -2147483648, 2147483647], u32: ['Uint32', 4, 0, 4294967295],
+  i64: ['BigInt64', 8, -(2n ** 63n), 2n ** 63n - 1n], u64: ['BigUint64', 8, 0n, 2n ** 64n - 1n],
+  f32: ['Float32', 4], f64: ['Float64', 8],
+};
+
+// Patcher: leaves remember their byte span; save() splices re-encoded tokens into
+// the original bytes, so everything we did not model is preserved byte-for-byte.
+// `sizes` = offsets of int32 LE length fields that enclose the token (fixed up by delta).
+function Patcher(src) {
+  const boxes = [];
+  const p = {
+    leaf(t, v, off, len, enc, extra = {}) { const b = { [LEAF]: true, t, v, orig: v, off, len, enc, ...extra }; boxes.push(b); return b; },
+    num(r, kind, extra = {}) {
+      const [k, n, min, max] = NUM[kind], off = r.o, v = r.num(k, n, extra.le ?? true);
+      const t = kind[0] === 'f' ? 'float' : 'int';
+      return p.leaf(t, v, off, n, x => W().num(k, x, extra.le ?? true).out, { min, max, ...extra });
+    },
+    get changed() { return boxes.filter(b => b.v !== b.orig); },
+    save(extra = []) {
+      const out = src.slice(), dv = new DataView(out.buffer);
+      const edits = p.changed.map(b => ({ off: b.off, len: b.len, bytes: b.enc(b.v), sizes: b.sizes })).concat(extra);
+      for (const e of edits) {
+        const d = e.bytes.length - e.len;
+        for (const s of (d && e.sizes) || []) dv.setInt32(s, dv.getInt32(s, true) + d, true);
+      }
+      edits.sort((a, b) => a.off - b.off);
+      const parts = []; let o = 0;
+      for (const e of edits) { parts.push(out.subarray(o, e.off), e.bytes); o = e.off + e.len; }
+      parts.push(out.subarray(o));
+      return concat(parts);
+    },
+  };
+  return p;
+}
+
+// Box whose value lives in a DataView (in-place binary editing)
+function dvBox(dv, off, kind, extra = {}) {
+  const [k, , min, max] = NUM[kind];
+  const b = { [LEAF]: true, t: kind[0] === 'f' ? 'float' : 'int', min, max, ...extra };
+  return Object.defineProperty(b, 'v', { enumerable: true, get: () => dv['get' + k](off, true), set: x => dv['set' + k](off, x, true) });
+}
+
+function keyLabel(k) {
+  if (isBox(k)) return String(k.v);
+  if (Array.isArray(k)) return `(${k.map(keyLabel).join(', ')})`;
+  if (k !== null && typeof k === 'object') return k[LABEL] || 'object';
+  return String(k);
+}
+// children of a container as [label, holder, key]; holder[key] is the child
+function kidsOf(node) {
+  if (node[KIDS]) return node[KIDS]();
+  if (node instanceof Map) return [...node].map(([k, v]) => [keyLabel(k), { v }, 'v']);
+  return Object.keys(node).map(k => [k, node, k]);
+}
+
+const ext = name => (name.split('.').pop() || '').toLowerCase();

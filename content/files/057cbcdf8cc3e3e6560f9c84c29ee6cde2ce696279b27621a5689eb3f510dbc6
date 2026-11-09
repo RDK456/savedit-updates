@@ -1,0 +1,61 @@
+// Desktop (Tauri) vs browser: file access, drop, and updates.
+const platform = (() => {
+  const T = window.__TAURI__;
+  const base = p => p.split(/[\\/]/).pop();
+  if (T?.core) {
+    const { invoke } = T.core;
+    const read = async path => ({ name: base(path), path, bytes: new Uint8Array(await invoke('read_file', { path })) });
+    const write = (path, bytes) => invoke('write_file', bytes, { headers: { 'x-path': encodeURIComponent(path) } });
+    return {
+      desktop: true,
+      async open() { const p = await invoke('open_dialog'); return p ? read(p) : null; },
+      read,
+      async save(file, bytes) {
+        const bak = await write(file.path, bytes);
+        return bak ? `Saved. The original is kept as ${base(bak)}.` : 'Saved.';
+      },
+      async saveAs(file, bytes) {
+        const p = await invoke('save_dialog', { current: file.path });
+        if (!p) return null;
+        await write(p, bytes);
+        return { path: p, name: base(p), message: `Saved a copy as ${base(p)}.` };
+      },
+      startup: () => invoke('startup_file'),
+      onDrop(open, show) {
+        T.event.listen('tauri://drag-enter', () => show(true));
+        T.event.listen('tauri://drag-leave', () => show(false));
+        T.event.listen('tauri://drag-drop', e => { show(false); const p = e.payload?.paths?.[0]; if (p) read(p).then(open, err => open(null, err)); });
+      },
+      update: {
+        check: () => invoke('update_check'),
+        apply: () => invoke('update_apply'),
+        shell: () => invoke('shell_update'),
+        onProgress: cb => T.event.listen('update-progress', e => cb(...e.payload)),
+      },
+    };
+  }
+  const input = document.getElementById('file');
+  const download = (name, bytes) => {
+    const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([bytes])), download: name });
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  const fromFile = async f => ({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
+  return {
+    desktop: false,
+    open: () => new Promise(res => {
+      input.onchange = () => { const f = input.files[0]; input.value = ''; res(f ? fromFile(f) : null); };
+      input.click();
+    }),
+    async save(file, bytes) { download(file.name, bytes); return 'Downloaded the edited save. Copy it over the original in the game folder.'; },
+    async saveAs(file, bytes) { download(file.name, bytes); return { message: 'Downloaded a copy.' }; },
+    startup: async () => null,
+    onDrop(open, show) {
+      let depth = 0;
+      addEventListener('dragenter', e => { e.preventDefault(); if (++depth === 1) show(true); });
+      addEventListener('dragleave', () => { if (--depth === 0) show(false); });
+      addEventListener('dragover', e => e.preventDefault());
+      addEventListener('drop', e => { e.preventDefault(); depth = 0; show(false); const f = e.dataTransfer.files[0]; if (f) fromFile(f).then(open); });
+    },
+    update: null,
+  };
+})();

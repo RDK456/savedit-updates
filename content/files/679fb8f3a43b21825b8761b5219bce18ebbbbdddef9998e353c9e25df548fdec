@@ -38,7 +38,7 @@ body {
 .i { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
 /* label voice: the guide's condensed caps */
-.bar, th, .tab, .tip b, .label { font-stretch: var(--narrow); font-weight: 700; text-transform: uppercase; letter-spacing: .08em; font-size: 12px; }
+.bar, th, .tip b, .label { font-stretch: var(--narrow); font-weight: 700; text-transform: uppercase; letter-spacing: .08em; font-size: 12px; }
 
 /* ---- top bar ---- */
 .top { grid-row: 1; display: flex; align-items: center; gap: 20px; padding: 0 16px; background: var(--ink); color: var(--white); }
@@ -66,8 +66,8 @@ body {
 .banner { grid-row: 2; display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: var(--red); color: var(--white); font-weight: 600; }
 .banner span { flex: 1; }
 
-/* ---- three columns: contents | page | thumb tabs ---- */
-.body { grid-row: 3; display: grid; grid-template-columns: 264px minmax(0, 1fr) 52px; min-height: 0; }
+/* ---- two columns: contents | page ---- */
+.body { grid-row: 3; display: grid; grid-template-columns: 264px minmax(0, 1fr); min-height: 0; }
 .contents { border-right: 2px solid var(--ink); overflow: auto; background: var(--paper); }
 .contents .bar { margin: 0; padding: 8px 14px; background: var(--ink); color: var(--white); position: sticky; top: 0; z-index: 1; }
 .toc, .toc ol { list-style: none; margin: 0; padding: 0; }
@@ -149,18 +149,13 @@ tr.changed .check:checked { background: var(--red); }
 .formats th:first-child { width: 55%; }
 .formats td:last-child { color: var(--ink-2); }
 
-/* ---- thumb tabs ---- */
-.tabs { display: flex; flex-direction: column; gap: 3px; padding: 14px 0; border-left: 2px solid var(--ink); overflow-x: hidden; overflow-y: auto; background: var(--paper); }
-.tab { writing-mode: vertical-rl; border: 0; color: var(--white); background: var(--sec); width: 38px; margin-left: 8px; padding: 14px 0; cursor: pointer; text-align: center; max-height: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: width .18s var(--ease), margin .18s var(--ease); flex: none; }
-.tab:hover { width: 44px; margin-left: 2px; }
-.tab[aria-current="true"] { width: 50px; margin-left: -2px; }
-.tab.changes { margin-top: auto; background: var(--red); }
-.tab.changes:disabled { background: var(--ink-3); cursor: default; }
 
 /* ---- status bar ---- */
 .status { grid-row: 4; display: flex; align-items: center; gap: 18px; padding: 0 14px; border-top: 2px solid var(--ink); background: var(--stripe); font-size: 12.5px; color: var(--ink-2); white-space: nowrap; overflow: hidden; }
 .status #stFile { color: var(--ink); font-weight: 600; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .fmt select { max-width: 190px; font: 12.5px Archivo, sans-serif; border: 1px solid var(--rule); background: var(--paper); color: var(--ink); padding: 1px 4px; margin-left: 4px; }
+.st-changes { border: 0; background: none; font: inherit; color: inherit; padding: 0; }
+.st-changes:not(:disabled) { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .st-changes.dirty { color: var(--red-ink); font-weight: 700; }
 .st-msg { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .st-update { margin-left: auto; display: flex; align-items: center; gap: 8px; }
@@ -170,7 +165,7 @@ tr.changed .check:checked { background: var(--red); }
 .drop div { border: 3px dashed var(--white); color: var(--white); padding: 48px 64px; font-size: 22px; font-weight: 800; }
 
 @media (max-width: 1100px) {
-  .body { grid-template-columns: 220px minmax(0, 1fr) 48px; }
+  .body { grid-template-columns: 220px minmax(0, 1fr); }
   .btn.ghost span, #saveAs { display: none; }
   .start { grid-template-columns: 1fr; }
 }

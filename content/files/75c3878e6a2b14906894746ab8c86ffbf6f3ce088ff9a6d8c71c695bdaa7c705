@@ -1,0 +1,145 @@
+// Unreal Engine GVAS (.sav). Property tags carry byte sizes; leaves remember every
+// enclosing size field so string edits fix them up. Unknown properties stay opaque.
+// UE 5.4+ (object version 1012) writes "complete type name" tags: a type tree, then size and a flags byte.
+function parseGvas(b) {
+  const P = Patcher(b), r = new Rd(b);
+  const fstr = () => {
+    const n = r.i32();
+    if (n === 0) return '';
+    if (Math.abs(n) > 1 << 24) throw Error(`bad string length at byte ${r.o - 4}`);
+    return (n > 0 ? latin1(r.bytes(n)) : new TextDecoder('utf-16le').decode(r.bytes(-n * 2))).replace(/\0$/, '');
+  };
+  const encF = s => {
+    if (s === '') return new Uint8Array(4);
+    if (/^[\x00-\x7f]*$/.test(s)) return W().num('Int32', s.length + 1).bytes(fromLatin1(s)).u8(0).out;
+    const u = Uint8Array.from([...s + '\0'].flatMap(c => { const x = c.charCodeAt(0); return [x & 0xff, x >> 8]; }));
+    return W().num('Int32', -(s.length + 1)).bytes(u).out;
+  };
+  const fbox = st => { const s = r.o, v = fstr(); return P.leaf('str', v, s, r.o - s, encF, { sizes: st }); };
+  const guid = () => { if (r.u8()) r.bytes(16); };
+  const NUMS = { IntProperty: 'i32', Int8Property: 'i8', Int16Property: 'i16', Int64Property: 'i64', UInt16Property: 'u16', UInt32Property: 'u32', UInt64Property: 'u64', FloatProperty: 'f32', DoubleProperty: 'f64', ByteProperty: 'u8' };
+  const STRS = ['StrProperty', 'NameProperty', 'ObjectProperty', 'EnumProperty'];
+
+  if (latin1(r.bytes(4)) !== 'GVAS') throw Error('not a GVAS file');
+  const sv = r.i32(); r.i32(); const NEW = sv >= 3 && r.i32() >= 1012;
+  r.u16(); r.u16(); r.u16(); r.u32(); fstr();
+  r.i32(); for (let n = r.i32(); n--;) r.bytes(20);
+  const cls = fstr(); if (NEW) r.u8(); // UE 5.4 adds a flags byte after the class name
+  const root = props([]);
+  root[LABEL] = cls.split('.').pop();
+  return { P, root };
+
+  function props(st) {
+    const o = {};
+    for (;;) {
+      const name = fstr();
+      if (name === 'None' || name === '') return o;
+      let v, idx = 0;
+      if (NEW) {
+        const type = ttree(), so = r.o, size = r.i32(), fo = r.o, fl = r.u8();
+        if (fl & 1) idx = r.i32();
+        if (fl & 2) r.bytes(16);
+        if (fl & 4 && r.u8() & 2) { r.u8(); r.u32(); }
+        v = prop5(type, size, [...st, so], fo, fl);
+      } else {
+        const type = fstr(), so = r.o, size = r.i32(); idx = r.i32();
+        v = prop(type, size, [...st, so]);
+      }
+      let key = idx ? `${name}[${idx}]` : name;
+      while (key in o) key += "'";
+      o[key] = v;
+    }
+  }
+  // FPropertyTypeName: pre-order list of (name, child count)
+  function ttree() { const name = fstr(), n = r.i32(); return { name, p: Array.from({ length: n }, ttree) }; }
+  function prop5(t, size, st, fo, fl) {
+    const a = t.p[0]?.name, type = t.name;
+    switch (type) {
+      case 'BoolProperty': return P.leaf('bool', !!(fl & 16), fo, 1, x => Uint8Array.of(x ? fl | 16 : fl & ~16));
+      case 'StructProperty': return body(type, size, () => struct(a, size, st));
+      case 'ByteProperty': return body(type, size, () => size === 1 ? P.num(r, 'u8') : fbox(st));
+      case 'EnumProperty': return body(type, size, () => fbox(st));
+      case 'ArrayProperty': return body(type, size, () => array(a, size, st, t.p[0].p[0]?.name));
+      case 'SetProperty': return body(type, size, () => { if (r.i32()) throw 0; return Array.from({ length: r.i32() }, () => raw(a, st)); });
+      case 'MapProperty': return body(type, size, () => {
+        if (r.i32()) throw 0;
+        const m = new Map();
+        for (let n = r.i32(); n--;) { const k = raw(a, st, true); m.set(k, raw(t.p[1].name, st)); }
+        return m;
+      });
+      default: return body(type, size, () => raw(type, st));
+    }
+  }
+  function body(type, size, fn) {
+    const start = r.o;
+    try { const v = fn(); if (r.o === start + size) return v; } catch {}
+    r.o = start; r.bytes(size);
+    return ro(`<${type}, ${size} bytes>`);
+  }
+  function prop(type, size, st) {
+    switch (type) {
+      case 'BoolProperty': { const s = r.o, v = r.u8(); guid(); return P.leaf('bool', !!v, s, 1, x => Uint8Array.of(x ? 1 : 0)); }
+      case 'StructProperty': { const sn = fstr(); r.bytes(16); guid(); return body(type, size, () => struct(sn, size, st)); }
+      case 'ByteProperty': { fstr(); guid(); return body(type, size, () => size === 1 ? P.num(r, 'u8') : fbox(st)); }
+      case 'EnumProperty': { fstr(); guid(); return body(type, size, () => fbox(st)); }
+      case 'ArrayProperty': { const it = fstr(); guid(); return body(type, size, () => array(it, size, st)); }
+      case 'SetProperty': {
+        const it = fstr(); guid();
+        return body(type, size, () => { if (r.i32()) throw 0; return Array.from({ length: r.i32() }, () => raw(it, st)); });
+      }
+      case 'MapProperty': {
+        const kt = fstr(), vt = fstr(); guid();
+        return body(type, size, () => {
+          if (r.i32()) throw 0;
+          const m = new Map();
+          for (let n = r.i32(); n--;) { const k = raw(kt, st, true); m.set(k, raw(vt, st)); }
+          return m;
+        });
+      }
+      default: guid(); return body(type, size, () => raw(type, st));
+    }
+  }
+  function raw(type, st, isKey) {
+    if (NUMS[type]) return P.num(r, NUMS[type]);
+    if (STRS.includes(type)) return fbox(st);
+    if (type === 'BoolProperty') { const s = r.o; return P.leaf('bool', !!r.u8(), s, 1, x => Uint8Array.of(x ? 1 : 0)); }
+    if (type === 'StructProperty') return isKey ? ro(hex(r.bytes(16))) : props(st);
+    if (type === 'TextProperty') { // FText: flags, history type; None (-1) and Base (0) carry plain strings
+      r.u32(); const h = r.u8();
+      if (h === 255) return r.u32() ? fbox(st) : ro('');
+      if (h === 0) { fstr(); fstr(); return fbox(st); }
+    }
+    throw Error(`unsupported inner type ${type}`);
+  }
+  function array(it, size, st, sn5) {
+    const n = r.i32();
+    if (it === 'StructProperty' && NEW) return Array.from({ length: n }, () => struct(sn5, n ? (size - 4) / n : 0, st));
+    if (it === 'StructProperty') {
+      fstr(); fstr(); const so = r.o, isz = r.i32(); r.i32();
+      const sn = fstr(); r.bytes(16); guid();
+      return Array.from({ length: n }, () => struct(sn, n ? isz / n : 0, [...st, so]));
+    }
+    if (it === 'ByteProperty' && n === size - 4 && n > 4096) { r.bytes(n); return [ro(`<${n} bytes>`)]; }
+    return Array.from({ length: n }, () => raw(it, st));
+  }
+  function struct(name, size, st) {
+    const fl = { Vector: 'xyz', Vector2D: 'xy', Rotator: ['pitch', 'yaw', 'roll'], Quat: 'xyzw', Vector4: 'xyzw' }[name];
+    const fields = (keys, kind) => { const o = { [LABEL]: name }; for (const k of keys) o[k] = P.num(r, kind); return o; };
+    if (fl) return fields(fl, size === fl.length * 8 ? 'f64' : 'f32'); // UE5 large-world coords use doubles
+    switch (name) {
+      case 'LinearColor': return fields('rgba', 'f32');
+      case 'Color': return fields('bgra', 'u8');
+      case 'IntPoint': return fields('xy', 'i32');
+      case 'IntVector': return fields('xyz', 'i32');
+      case 'DateTime': case 'Timespan': return P.num(r, 'i64');
+      case 'Guid': return ro(hex(r.bytes(16)));
+      default: { const o = props(st); o[LABEL] = name; return o; }
+    }
+  }
+}
+
+FORMATS.push({
+  id: 'gvas', label: 'Unreal Engine (GVAS .sav)', exts: ['sav'],
+  test: b => latin1(b.subarray(0, 4)) === 'GVAS',
+  open(b) { const { P, root } = parseGvas(b); return { root, save: () => P.save() }; },
+});

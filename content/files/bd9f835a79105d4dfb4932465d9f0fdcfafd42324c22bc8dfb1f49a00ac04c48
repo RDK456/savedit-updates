@@ -1,0 +1,407 @@
+// INI / Godot ConfigFile, XML (Unity PlayerPrefs, plist), binary plist, MessagePack,
+// Minecraft NBT (Java + Bedrock), Flash Shared Objects (.sol, AMF0/AMF3).
+
+// Text splicer: leaves remember a span in a JS string; save() rebuilds the string.
+function TextPatcher(src) {
+  const boxes = [];
+  return {
+    leaf(t, v, off, len, enc, extra = {}) { const b = { [LEAF]: true, t, v, orig: v, off, len, enc, ...extra }; boxes.push(b); return b; },
+    save() {
+      let out = '', o = 0;
+      for (const b of boxes.filter(b => b.v !== b.orig).sort((a, b) => a.off - b.off)) { out += src.slice(o, b.off) + b.enc(b.v); o = b.off + b.len; }
+      return out + src.slice(o);
+    },
+  };
+}
+const tdBom = new TextDecoder('utf-8', { ignoreBOM: true });
+const isText = b => { const h = b.subarray(0, 4096); try { new TextDecoder('utf-8', { fatal: true }).decode(h, { stream: true }); return !h.includes(0); } catch { return false; } };
+const numType = s => /^[+-]?\d+$/.test(s) && Math.abs(+s) <= Number.MAX_SAFE_INTEGER ? 'int' : /^[+-]?(\d+\.\d*|\.\d+|\d+)(e[+-]?\d+)?$/i.test(s) ? 'float' : null;
+const fmtNum = (x, like) => { const s = String(x); return /\.\d+$/.test(like) && !s.includes('.') && !/e/i.test(s) ? x.toFixed(like.split('.')[1].length) : s; };
+function textLeaf(P, raw, off, quote = '') {
+  const t = numType(raw);
+  if (t) return P.leaf(t, +raw, off, raw.length, x => fmtNum(x, raw));
+  if (raw === 'true' || raw === 'false') return P.leaf('bool', raw === 'true', off, raw.length, String);
+  return P.leaf('str', raw, off, raw.length, quote ? x => x.replace(/\\/g, '\\\\').replace(new RegExp(quote, 'g'), '\\' + quote) : String);
+}
+
+// ---- INI / Godot .cfg / GameMaker .ini
+FORMATS.push({
+  id: 'ini', label: 'INI / Godot ConfigFile / GameMaker (.ini, .cfg)', exts: ['ini', 'cfg', 'sav', 'txt'],
+  test: (b, n) => isText(b) && (['ini', 'cfg'].includes(ext(n)) || /^\s*\[[^\]\r\n]+\]\s*\r?\n\s*[^=\r\n]+=/.test(tdBom.decode(b.subarray(0, 512)).replace(/^﻿/, ''))),
+  open(b) {
+    const text = tdBom.decode(b), P = TextPatcher(text), root = {};
+    let sec = root, n = 0;
+    const re = /^[ \t]*(?:\[([^\]\r\n]+)\]|([^=;#[\r\n][^=\r\n]*?)[ \t]*=[ \t]*([^\r\n]*?))[ \t]*\r?$/gmd;
+    for (let m; (m = re.exec(text));) {
+      if (m[1] != null) { let k = m[1]; while (k in root) k += "'"; sec = root[k] = {}; continue; }
+      let key = m[2].trim(); const raw = m[3], off = m.indices[3][0];
+      while (key in sec) key += "'";
+      const q = /^"(.*)"$/s.exec(raw);
+      sec[key] = q ? textLeaf(P, q[1].replace(/\\"/g, '"'), off + 1, '"') : textLeaf(P, raw, off);
+      n++;
+    }
+    if (!n) throw Error('no key=value lines');
+    return { root, save: () => te8.encode(P.save()) };
+  },
+});
+
+// ---- XML (generic, Unity PlayerPrefs <map>, Apple plist)
+const xmlDec = s => s.replace(/&(lt|gt|amp|quot|apos|#x[0-9a-f]+|#\d+);/gi, (_, e) => ({ lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" }[e.toLowerCase()] ?? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : +e.slice(1))));
+const xmlEnc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function parseXml(text) {
+  const top = { name: '#doc', kids: [], attrs: [] }, stack = [top];
+  const re = /<!--[\s\S]*?-->|<!\[CDATA\[([\s\S]*?)\]\]>|<\?[\s\S]*?\?>|<![^>]*>|<(\/?)([\w:.-]+)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>/g;
+  let last = 0;
+  for (let m; (m = re.exec(text));) {
+    const cur = stack[stack.length - 1];
+    if (m.index > last && /\S/.test(text.slice(last, m.index))) cur.text = { off: last, len: m.index - last };
+    last = re.lastIndex;
+    if (m[1] != null) { cur.text = { off: m.index + 9, len: m[1].length, cdata: true }; continue; }
+    if (!m[3]) continue;
+    if (m[2]) { if (stack.length > 1 && stack.pop().name !== m[3]) throw Error(`mismatched </${m[3]}>`); continue; }
+    const el = { name: m[3], kids: [], attrs: [], off: m.index, len: m[0].length };
+    const ab = m.index + 1 + m[3].length;
+    for (const a of m[4].matchAll(/([\w:.-]+)\s*=\s*(["'])(.*?)\2/gs))
+      el.attrs.push({ name: a[1], off: ab + a.index + a[0].length - 1 - a[3].length, len: a[3].length, v: xmlDec(a[3]) });
+    cur.kids.push(el);
+    if (!m[5]) stack.push(el);
+  }
+  if (stack.length > 1 || !top.kids.length) throw Error('not well-formed XML');
+  return top.kids.find(k => k.name) || top.kids[0];
+}
+function xmlDoc(text) {
+  const P = TextPatcher(text), root0 = parseXml(text);
+  const txt = el => el.text ? text.substr(el.text.off, el.text.len) : '';
+  const leafText = (el, kind) => {
+    const raw = txt(el), off = el.text?.off ?? el.off + el.len, t = kind || numType(raw.trim()) || 'str';
+    const enc = el.text?.cdata ? String : xmlEnc;
+    if (!el.text && el.len && text[el.off + el.len - 2] === '/') return ro('');
+    const v = t === 'int' || t === 'float' ? +raw.trim() : xmlDec(raw);
+    return P.leaf(t, v, off, el.text?.len ?? 0, t === 'str' ? enc : x => fmtNum(x, raw.trim()));
+  };
+  const attrLeaf = (a, kind) => {
+    const t = kind || numType(a.v) || (a.v === 'true' || a.v === 'false' ? 'bool' : 'str');
+    const v = t === 'int' || t === 'float' ? +a.v : t === 'bool' ? a.v === 'true' : a.v;
+    return P.leaf(t, v, a.off, a.len, x => t === 'str' ? xmlEnc(x) : fmtNum(x, a.v));
+  };
+  const put = (o, k, v) => { while (k in o) k += "'"; o[k] = v; };
+  function plist(el) {
+    switch (el.name) {
+      case 'dict': { const o = {}; for (let i = 0; i + 1 < el.kids.length; i += 2) put(o, xmlDec(txt(el.kids[i])), plist(el.kids[i + 1])); return o; }
+      case 'array': return el.kids.map(plist);
+      case 'integer': return leafText(el, 'int');
+      case 'real': return leafText(el, 'float');
+      case 'true': case 'false': return P.leaf('bool', el.name === 'true', el.off, el.len, x => x ? '<true/>' : '<false/>');
+      case 'data': return ro(txt(el).replace(/\s+/g, ''));
+      default: return leafText(el, 'str');
+    }
+  }
+  function node(el) {
+    if (el.name === 'plist') return el.kids.length === 1 ? plist(el.kids[0]) : el.kids.map(plist);
+    const o = { [LABEL]: el.name };
+    const kindOf = { int: 'int', long: 'int', float: 'float', double: 'float', string: 'str', boolean: 'bool' }[el.name];
+    for (const a of el.attrs) put(o, '@' + a.name, attrLeaf(a, a.name === 'value' && kindOf));
+    for (const k of el.kids) {
+      const name = k.attrs.find(a => a.name === 'name')?.v;
+      const valueAttr = k.attrs.find(a => a.name === 'value');
+      const pk = { int: 'int', long: 'int', float: 'float', double: 'float', boolean: 'bool' }[k.name];
+      if (name != null && k.attrs.length === 2 && valueAttr) put(o, name, attrLeaf(valueAttr, pk)); // Unity PlayerPrefs <int name= value=/>
+      else if (!k.kids.length && k.attrs.length <= (name != null ? 1 : 0)) put(o, name ?? k.name, leafText(k, k.name === 'string' ? 'str' : null));
+      else put(o, name ?? k.name, node(k));
+    }
+    if (!el.kids.length && el.text) put(o, '#text', leafText(el));
+    return o;
+  }
+  const root = node(root0);
+  return { root: root && typeof root === 'object' && !isBox(root) ? root : { value: root }, save: () => P.save() };
+}
+FORMATS.push({
+  id: 'xml', label: 'XML (Unity PlayerPrefs, plist, any engine)', exts: ['xml', 'plist', 'sav', 'save', 'dat'],
+  test: b => isText(b) && /^﻿?\s*</.test(tdBom.decode(b.subarray(0, 256))),
+  open(b) { const d = xmlDoc(tdBom.decode(b)); return { root: d.root, save: () => te8.encode(d.save()) }; },
+});
+
+// ---- Binary plist (bplist00): parsed to a tree, re-serialised on save.
+function readBplist(b) {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength), t = b.length - 32;
+  const osz = b[t + 6], rsz = b[t + 7], n = Number(dv.getBigUint64(t + 8)), top = Number(dv.getBigUint64(t + 16)), tbl = Number(dv.getBigUint64(t + 24));
+  const uint = (o, s) => { let v = 0; for (let i = 0; i < s; i++) v = v * 256 + b[o + i]; return v; };
+  const offs = Array.from({ length: n }, (_, i) => uint(tbl + i * osz, osz));
+  const seen = new Set();
+  function obj(i) {
+    if (seen.has(i)) throw Error('bplist cycle');
+    let o = offs[i]; const m = b[o], hi = m >> 4, lo = m & 15;
+    let len = lo; o++;
+    if (hi !== 0 && hi !== 1 && hi !== 2 && hi !== 3 && lo === 15) { const s = 1 << (b[o] & 15); len = uint(o + 1, s); o += 1 + s; }
+    switch (hi) {
+      case 0: return { k: 'bool', v: lo === 9 ? true : lo === 8 ? false : null };
+      case 1: { const s = 1 << lo; return { k: 'int', v: s === 8 ? Number(dv.getBigInt64(o)) : s === 16 ? Number(dv.getBigInt64(o + 8)) : uint(o, s) }; }
+      case 2: return { k: 'float', v: lo === 2 ? dv.getFloat32(o) : dv.getFloat64(o) };
+      case 3: return { k: 'date', v: dv.getFloat64(o) };
+      case 4: return { k: 'data', v: b.slice(o, o + len) };
+      case 5: return { k: 'str', v: latin1(b.subarray(o, o + len)) };
+      case 6: return { k: 'str', v: new TextDecoder('utf-16be').decode(b.subarray(o, o + len * 2)) };
+      case 8: return { k: 'uid', v: uint(o, lo + 1) };
+      case 10: case 12: { seen.add(i); const v = Array.from({ length: len }, (_, j) => obj(uint(o + j * rsz, rsz))); seen.delete(i); return { k: 'array', v }; }
+      case 13: {
+        seen.add(i); const v = new Map();
+        for (let j = 0; j < len; j++) v.set(obj(uint(o + j * rsz, rsz)).v, obj(uint(o + (len + j) * rsz, rsz)));
+        seen.delete(i); return { k: 'dict', v };
+      }
+      default: throw Error(`bplist type ${hi}`);
+    }
+  }
+  return obj(top);
+}
+function writeBplist(rootNode) {
+  const objs = [], refs = [];
+  const add = n => { const i = objs.length; objs.push(null); objs[i] = n; return i; };
+  // flatten, children first so counts are known
+  const flat = n => {
+    const i = add(n);
+    if (n.k === 'array') refs[i] = n.v.map(flat);
+    if (n.k === 'dict') { const ks = [...n.v.keys()].map(k => flat({ k: 'str', v: k })); refs[i] = ks.concat([...n.v.values()].map(flat)); }
+    return i;
+  };
+  flat(rootNode);
+  const rsz = objs.length < 256 ? 1 : objs.length < 65536 ? 2 : 4;
+  const parts = [fromLatin1('bplist00')], offs = []; let pos = 8;
+  const be = (v, s) => { const a = new Uint8Array(s); for (let i = s - 1; i >= 0; i--) { a[i] = v & 255; v = Math.floor(v / 256); } return a; };
+  const hdr = (hi, len) => len < 15 ? Uint8Array.of(hi << 4 | len) : concat([Uint8Array.of(hi << 4 | 15), Uint8Array.of(0x12), be(len, 4)]);
+  objs.forEach((n, i) => {
+    let out;
+    const v = n.v;
+    switch (n.k) {
+      case 'bool': out = Uint8Array.of(v === null ? 0 : v ? 9 : 8); break;
+      case 'int': { const dv = new DataView(new ArrayBuffer(9)); dv.setUint8(0, 0x13); dv.setBigInt64(1, BigInt(Math.trunc(v))); out = new Uint8Array(dv.buffer); break; }
+      case 'float': case 'date': { const dv = new DataView(new ArrayBuffer(9)); dv.setUint8(0, n.k === 'date' ? 0x33 : 0x23); dv.setFloat64(1, v); out = new Uint8Array(dv.buffer); break; }
+      case 'data': out = concat([hdr(4, v.length), v]); break;
+      case 'str': {
+        if (/^[\x00-\x7f]*$/.test(v)) out = concat([hdr(5, v.length), fromLatin1(v)]);
+        else { const u = new Uint8Array(v.length * 2), dv = new DataView(u.buffer); for (let j = 0; j < v.length; j++) dv.setUint16(j * 2, v.charCodeAt(j)); out = concat([hdr(6, v.length), u]); }
+        break;
+      }
+      case 'uid': out = concat([Uint8Array.of(0x83), be(v, 4)]); break;
+      case 'array': out = concat([hdr(10, refs[i].length), ...refs[i].map(r => be(r, rsz))]); break;
+      case 'dict': out = concat([hdr(13, refs[i].length / 2), ...refs[i].map(r => be(r, rsz))]); break;
+    }
+    offs.push(pos); parts.push(out); pos += out.length;
+  });
+  const osz = pos < 256 ? 1 : pos < 65536 ? 2 : 4;
+  parts.push(...offs.map(o => be(o, osz)));
+  const tr = new Uint8Array(32), dv = new DataView(tr.buffer);
+  tr[6] = osz; tr[7] = rsz; dv.setBigUint64(8, BigInt(objs.length)); dv.setBigUint64(16, 0n); dv.setBigUint64(24, BigInt(pos));
+  parts.push(tr);
+  return concat(parts);
+}
+FORMATS.push({
+  id: 'bplist', label: 'Binary plist (Unity PlayerPrefs on macOS/iOS)', exts: ['plist'],
+  test: b => latin1(b.subarray(0, 8)) === 'bplist00',
+  open(b) {
+    const tree = readBplist(b);
+    const view = n => {
+      switch (n.k) {
+        case 'dict': { const o = {}; for (const [k, v] of n.v) o[k] = view(v); return o; }
+        case 'array': return n.v.map(view);
+        case 'data': return ro(hex(n.v.subarray(0, 64)) + (n.v.length > 64 ? ' …' : ''));
+        case 'uid': return ro(`UID ${n.v}`);
+        case 'bool': return n.v === null ? ro('null') : Object.defineProperty({ [LEAF]: true, t: 'bool', orig: n.v }, 'v', { enumerable: true, get: () => n.v, set: x => { n.v = x; } });
+        default: {
+          const t = n.k === 'date' ? 'float' : n.k;
+          return Object.defineProperty({ [LEAF]: true, t, orig: n.v }, 'v', { enumerable: true, get: () => n.v, set: x => { n.v = x; } });
+        }
+      }
+    };
+    const root = view(tree);
+    return { root: isBox(root) ? { value: root } : root, save: () => writeBplist(tree) };
+  },
+});
+
+// ---- MessagePack (Unity MessagePack-CSharp and others)
+function parseMsgpack(b) {
+  const P = Patcher(b), r = new Rd(b);
+  const encInt = x => {
+    const v = BigInt(x);
+    if (v >= 0n && v < 128n) return Uint8Array.of(Number(v));
+    if (v < 0n && v >= -32n) return Uint8Array.of(Number(v) & 0xff);
+    const k = v >= 0n ? [[0xcc, 'Uint8', 256n], [0xcd, 'Uint16', 65536n], [0xce, 'Uint32', 2n ** 32n], [0xcf, 'BigUint64', 2n ** 64n]]
+      : [[0xd0, 'Int8', -128n], [0xd1, 'Int16', -32768n], [0xd2, 'Int32', -(2n ** 31n)], [0xd3, 'BigInt64', -(2n ** 63n)]];
+    const [tag, kind] = k.find(([, , lim]) => v >= 0n ? v < lim : v >= lim);
+    return W().u8(tag).num(kind, kind.startsWith('Big') ? v : Number(v), false).out;
+  };
+  const encStr = s => { const u = te8.encode(s), n = u.length; return concat([n < 32 ? Uint8Array.of(0xa0 | n) : n < 256 ? Uint8Array.of(0xd9, n) : n < 65536 ? W().u8(0xda).num('Uint16', n, false).out : W().u8(0xdb).num('Uint32', n, false).out, u]); };
+  const big = v => typeof v === 'bigint' && v >= -(2n ** 53n) && v <= 2n ** 53n ? Number(v) : v;
+  function val() {
+    const s = r.o, m = r.u8();
+    const int = v => P.leaf('int', big(v), s, r.o - s, encInt, { min: -(2n ** 63n), max: 2n ** 64n - 1n });
+    const str = n => P.leaf('str', td8.decode(r.bytes(n)), s, r.o - s, encStr);
+    const arr = n => Array.from({ length: n }, val);
+    const map = n => { const o = new Map(); for (let i = 0; i < n; i++) { const k = val(); o.set(isBox(k) && typeof k.v !== 'object' ? k.v : k, val()); } return o; };
+    const bin = n => ro(`<${n} bytes>`, (r.bytes(n), {}));
+    const ext = n => { const t = r.i8(); r.bytes(n); return ro(`<ext ${t}, ${n} bytes>`); };
+    if (m < 0x80) return int(m);
+    if (m >= 0xe0) return int(m - 256);
+    if (m >= 0xa0 && m < 0xc0) return str(m & 31);
+    if (m >= 0x90 && m < 0xa0) return arr(m & 15);
+    if (m >= 0x80 && m < 0x90) return map(m & 15);
+    switch (m) {
+      case 0xc0: return ro('nil');
+      case 0xc2: case 0xc3: return P.leaf('bool', m === 0xc3, s, 1, x => Uint8Array.of(x ? 0xc3 : 0xc2));
+      case 0xc4: return bin(r.u8()); case 0xc5: return bin(r.u16(false)); case 0xc6: return bin(r.u32(false));
+      case 0xc7: return ext(r.u8()); case 0xc8: return ext(r.u16(false)); case 0xc9: return ext(r.u32(false));
+      case 0xca: { const v = r.f32(false); return P.leaf('float', v, s, 5, x => W().u8(0xca).num('Float32', x, false).out); }
+      case 0xcb: { const v = r.f64(false); return P.leaf('float', v, s, 9, x => W().u8(0xcb).num('Float64', x, false).out); }
+      case 0xcc: return int(r.u8()); case 0xcd: return int(r.u16(false)); case 0xce: return int(r.u32(false)); case 0xcf: return int(r.u64(false));
+      case 0xd0: return int(r.i8()); case 0xd1: return int(r.i16(false)); case 0xd2: return int(r.i32(false)); case 0xd3: return int(r.i64(false));
+      case 0xd4: return ext(1); case 0xd5: return ext(2); case 0xd6: return ext(4); case 0xd7: return ext(8); case 0xd8: return ext(16);
+      case 0xd9: return str(r.u8()); case 0xda: return str(r.u16(false)); case 0xdb: return str(r.u32(false));
+      case 0xdc: return arr(r.u16(false)); case 0xdd: return arr(r.u32(false));
+      case 0xde: return map(r.u16(false)); case 0xdf: return map(r.u32(false));
+      default: throw Error(`not MessagePack (byte ${m} at ${s})`);
+    }
+  }
+  const root = val();
+  if (!r.eof) throw Error('trailing data after MessagePack value');
+  return { P, root };
+}
+FORMATS.push({
+  id: 'msgpack', label: 'MessagePack (Unity and others)', exts: ['msgpack', 'mpk', 'dat', 'sav', 'save', 'bytes'],
+  test: b => b.length > 1 && ((b[0] & 0xf0) === 0x80 || (b[0] & 0xf0) === 0x90 || b[0] >= 0xdc && b[0] <= 0xdf) && (() => { try { parseMsgpack(b); return true; } catch { return false; } })(),
+  open(b) { const { P, root } = parseMsgpack(b); return { root: isBox(root) ? { value: root } : root, save: () => P.save() }; },
+});
+
+// ---- NBT: Minecraft Java (big-endian, usually gzip) and Bedrock level.dat (little-endian, 8-byte header)
+function parseNbt(b, le) {
+  const P = Patcher(b), r = new Rd(b);
+  const mutf = s => te8.encode(s); // shortcut: writes standard UTF-8, Java "modified UTF-8" differs only for NUL and astral chars
+  const encStr = s => { const u = mutf(s); return concat([W().num('Uint16', u.length, le).out, u]); };
+  const rstr = () => td8.decode(r.bytes(r.u16(le)));
+  const KIND = { 1: 'i8', 2: 'i16', 3: 'i32', 4: 'i64', 5: 'f32', 6: 'f64' };
+  function payload(t) {
+    if (KIND[t]) { const v = P.num(r, KIND[t], { le }); if (typeof v.v === 'bigint' && v.v >= -(2n ** 53n) && v.v <= 2n ** 53n) { v.v = v.orig = Number(v.v); const e = v.enc; v.enc = x => e(BigInt(x)); } return v; }
+    switch (t) {
+      case 7: { const n = r.i32(le); return n > 256 ? ro(`<${n} bytes>`, (r.bytes(n), {})) : Array.from({ length: n }, () => P.num(r, 'i8')); }
+      case 8: { const s = r.o, v = rstr(); return P.leaf('str', v, s, r.o - s, encStr); }
+      case 9: { const it = r.u8(), n = r.i32(le); return Array.from({ length: n }, () => payload(it)); }
+      case 10: { const o = {}; for (let tt; (tt = r.u8());) { let k = rstr(); while (k in o) k += "'"; o[k] = payload(tt); } return o; }
+      case 11: { const n = r.i32(le); return Array.from({ length: n }, () => P.num(r, 'i32', { le })); }
+      case 12: { const n = r.i32(le); return Array.from({ length: n }, () => P.num(r, 'i64', { le })); }
+      default: throw Error(`bad NBT tag ${t} at ${r.o - 1}`);
+    }
+  }
+  if (r.u8() !== 10) throw Error('NBT root is not a compound');
+  const name = rstr(), root = payload(10);
+  if (!r.eof) throw Error('trailing data after NBT');
+  if (name) root[LABEL] = name;
+  return { P, root };
+}
+function nbtOpen(b) {
+  const gz = b[0] === 0x1f && b[1] === 0x8b, z = b[0] === 0x78 && (b[0] * 256 + b[1]) % 31 === 0;
+  const raw = gz || z ? pako.inflate(b) : b;
+  const bedrock = !gz && !z && raw[8] === 10 && new DataView(raw.buffer, raw.byteOffset).getUint32(4, true) === raw.length - 8;
+  const body = bedrock ? raw.subarray(8) : raw;
+  const { P, root } = parseNbt(body.slice(), bedrock);
+  return {
+    root, save() {
+      if (!P.changed.length) return b;
+      const out = P.save();
+      if (bedrock) { const h = raw.slice(0, 8); new DataView(h.buffer).setUint32(4, out.length, true); return concat([h, out]); }
+      return gz ? pako.gzip(out) : z ? pako.deflate(out) : out;
+    },
+  };
+}
+FORMATS.push({
+  id: 'nbt', label: 'Minecraft NBT (level.dat, .nbt, .dat)', exts: ['dat', 'nbt', 'dat_old', 'schematic', 'litematic', 'mcstructure'],
+  test: b => b[0] === 10 || b[0] === 0x1f && b[1] === 0x8b && (() => { try { return pako.inflate(b)[0] === 10; } catch { return false; } })() || b[8] === 10 && b.length > 12 && new DataView(b.buffer, b.byteOffset).getUint32(4, true) === b.length - 8,
+  open: nbtOpen,
+});
+
+// ---- Flash Shared Object (.sol): AMF0 or AMF3 values
+function parseSol(b) {
+  const P = Patcher(b), r = new Rd(b);
+  if (r.u16(false) !== 0x00bf) throw Error('not a .sol file');
+  r.u32(false);
+  if (latin1(r.bytes(4)) !== 'TCSO') throw Error('not a .sol file');
+  r.bytes(6);
+  const name = latin1(r.bytes(r.u16(false))), amf = r.u32(false);
+  const u8s = s => te8.encode(s);
+  // AMF0
+  const s0 = () => td8.decode(r.bytes(r.u16(false)));
+  const enc0 = s => { const u = u8s(s); return u.length < 65536 ? concat([Uint8Array.of(2), W().num('Uint16', u.length, false).out, u]) : concat([Uint8Array.of(12), W().num('Uint32', u.length, false).out, u]); };
+  function v0() {
+    const s = r.o, m = r.u8();
+    switch (m) {
+      case 0: { const v = r.f64(false); return P.leaf(Number.isInteger(v) ? 'int' : 'float', v, s, 9, x => W().u8(0).num('Float64', x, false).out, { min: -(2 ** 53), max: 2 ** 53 }); }
+      case 1: return P.leaf('bool', !!r.u8(), s, 2, x => Uint8Array.of(1, x ? 1 : 0));
+      case 2: { const v = s0(); return P.leaf('str', v, s, r.o - s, enc0); }
+      case 12: { const v = td8.decode(r.bytes(r.u32(false))); return P.leaf('str', v, s, r.o - s, enc0); }
+      case 3: return props0({});
+      case 16: { const o = { [LABEL]: s0() }; return props0(o); }
+      case 8: r.u32(false); return props0({});
+      case 10: return Array.from({ length: r.u32(false) }, v0);
+      case 11: { const v = r.f64(false); r.i16(false); return ro(new Date(v).toISOString()); }
+      case 5: return ro('null'); case 6: return ro('undefined');
+      case 7: return ro(`ref ${r.u16(false)}`);
+      case 15: return ro(td8.decode(r.bytes(r.u32(false))));
+      case 17: return v3();
+      default: throw Error(`AMF0 type ${m} at ${s}`);
+    }
+  }
+  function props0(o) { for (;;) { const k = s0(); if (!k && b[r.o] === 9) { r.o++; return o; } let kk = k; while (kk in o) kk += "'"; o[kk] = v0(); } }
+  // AMF3 (with string/object/trait reference tables)
+  const strs = [], objs = [], traits = [];
+  const u29 = () => { let v = 0; for (let i = 0; i < 4; i++) { const x = r.u8(); if (i === 3) return (v << 8) | x; v = (v << 7) | (x & 127); if (!(x & 128)) return v; } return v; };
+  const encU29 = v => { v &= 0x1fffffff; if (v < 0x80) return [v]; if (v < 0x4000) return [v >> 7 | 128, v & 127]; if (v < 0x200000) return [v >> 14 | 128, v >> 7 & 127 | 128, v & 127]; return [v >> 22 | 128, v >> 15 & 127 | 128, v >> 8 & 127 | 128, v & 255]; };
+  const s3 = () => { const h = u29(); if (!(h & 1)) return strs[h >> 1]; const n = h >> 1; if (!n) return ''; const v = td8.decode(r.bytes(n)); strs.push(v); return v; };
+  const enc3str = s => { const u = u8s(s); return Uint8Array.from([6, ...encU29(u.length << 1 | 1), ...u]); };
+  function v3() {
+    const s = r.o, m = r.u8();
+    switch (m) {
+      case 0: return ro('undefined'); case 1: return ro('null');
+      case 2: case 3: return P.leaf('bool', m === 3, s, 1, x => Uint8Array.of(x ? 3 : 2));
+      case 4: { let v = u29(); if (v & 0x10000000) v -= 0x20000000; return P.leaf('int', v, s, r.o - s, x => Uint8Array.from([4, ...encU29(x)]), { min: -(2 ** 28), max: 2 ** 28 - 1 }); }
+      case 5: { const v = r.f64(false); return P.leaf('float', v, s, 9, x => W().u8(5).num('Float64', x, false).out); }
+      case 6: { const h = b[r.o]; const v = s3(); return h & 1 ? P.leaf('str', v, s, r.o - s, enc3str) : ro(v); }
+      case 7: case 11: { const h = u29(); if (!(h & 1)) return ro(`ref ${h >> 1}`); const v = td8.decode(r.bytes(h >> 1)); objs.push(v); return ro(v); }
+      case 8: { const h = u29(); if (!(h & 1)) return ro(`ref ${h >> 1}`); const v = r.f64(false); objs.push(v); return ro(new Date(v).toISOString()); }
+      case 9: {
+        const h = u29(); if (!(h & 1)) return objs[h >> 1] ?? ro(`ref ${h >> 1}`);
+        const o = {}; objs.push(o);
+        for (let k; (k = s3());) o[k] = v3();
+        for (let i = 0; i < h >> 1; i++) o[i] = v3();
+        return o;
+      }
+      case 10: {
+        const h = u29(); if (!(h & 1)) return objs[h >> 1] ?? ro(`ref ${h >> 1}`);
+        let tr;
+        if (!(h & 2)) tr = traits[h >> 2];
+        else { tr = { ext: !!(h & 4), dyn: !!(h & 8), cls: s3(), keys: [] }; const n = h >> 4; for (let i = 0; i < n; i++) tr.keys.push(s3()); traits.push(tr); }
+        if (tr.ext) throw Error('externalizable AMF3 class ' + tr.cls);
+        const o = tr.cls ? { [LABEL]: tr.cls } : {}; objs.push(o);
+        for (const k of tr.keys) o[k] = v3();
+        if (tr.dyn) for (let k; (k = s3());) o[k] = v3();
+        return o;
+      }
+      case 12: { const h = u29(); if (!(h & 1)) return ro(`ref ${h >> 1}`); r.bytes(h >> 1); objs.push(0); return ro(`<${h >> 1} bytes>`); }
+      default: throw Error(`AMF3 type ${m} at ${s}`);
+    }
+  }
+  const root = { [LABEL]: name };
+  while (!r.eof) {
+    const k = amf === 3 ? s3() : s0();
+    root[k] = amf === 3 ? v3() : v0();
+    r.u8();
+  }
+  return { P, root };
+}
+FORMATS.push({
+  id: 'sol', label: 'Flash Shared Object (.sol)', exts: ['sol'],
+  test: b => b[0] === 0 && b[1] === 0xbf && latin1(b.subarray(6, 10)) === 'TCSO',
+  open(b) {
+    const { P, root } = parseSol(b);
+    return { root, save() { const out = P.save(); new DataView(out.buffer).setUint32(2, out.length - 6); return out; } };
+  },
+});
+
+// keep the binary-scan fallback last in the "Read as" list
+FORMATS.push(...FORMATS.splice(FORMATS.findIndex(f => f.id === 'raw'), 1));

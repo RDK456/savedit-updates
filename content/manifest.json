@@ -1,10 +1,10 @@
 {
- "version": "0.0.1",
- "minShell": "0.0.1",
+ "version": "0.0.2",
+ "minShell": "0.0.2",
  "files": {
   "css/app.css": {
-   "sha256": "679fb8f3a43b21825b8761b5219bce18ebbbbdddef9998e353c9e25df548fdec",
-   "size": 12888
+   "sha256": "d46c93ac88311d19c286cf9d7118f8283ed0c89f6cdf49729f4b40622c76360b",
+   "size": 15191
   },
   "fonts/OFL.txt": {
    "sha256": "c3c8402eec0e31dc9a76851235b1c02a0bb821488b2db8e35bcc2ab60ca8fc2b",
@@ -23,12 +23,12 @@
    "size": 883
   },
   "index.html": {
-   "sha256": "84442c8c9704906ac7f80f8b33589abd29a23e0ddf5cc592b43aa66d89b7aa79",
-   "size": 4980
+   "sha256": "5fc46fa20b62eb223fce2e806d0a42bc2069bcf1ff628208ab08d262a1af1fbc",
+   "size": 5237
   },
   "js/app.js": {
-   "sha256": "65c3f3d01ecd0f8f07e1cd5fd7e86d11e9ecd0de97add7873836fe0c46975f03",
-   "size": 21757
+   "sha256": "45de0fa09ce54a7c6507b7a9eba1d216f2f8c1084a5600c0d5c2ad5e576ae611",
+   "size": 22177
   },
   "js/core.js": {
    "sha256": "1e1a8dd85abf30ff3a72e141e9f2125aa5c928b6602d5042f40ba35b949aa9a4",
@@ -61,6 +61,10 @@
   "js/formats/pickle.js": {
    "sha256": "62721753bb216bfdfb92b2815851cfe80d4a4dd13c5992109a22523896ba7915",
    "size": 10501
+  },
+  "js/live.js": {
+   "sha256": "6da64cc979b7ba13690c2b0cd11f916c4d6a4cce53b0b1a0f68d32727181580f",
+   "size": 33872
   },
   "js/platform.js": {
    "sha256": "057cbcdf8cc3e3e6560f9c84c29ee6cde2ce696279b27621a5689eb3f510dbc6",

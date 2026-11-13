@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Save Editor</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></symbol>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></symbol>
+    <symbol id="i-save" viewBox="0 0 24 24"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><path d="M11.35 22H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.706.706l3.588 3.588A2.4 2.4 0 0 1 20 8v5.35"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/><path d="M14 19h6"/><path d="M17 16v6"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></symbol>
+    <symbol id="i-enter" viewBox="0 0 24 24"><path d="M20 4v7a4 4 0 0 1-4 4H4"/><path d="m9 10-5 5 5 5"/></symbol>
+  </defs>
+</svg>
+
+<header class="top">
+  <div class="brand"><img src="img/mark.svg" alt="" width="26" height="26"><span>Save Editor</span></div>
+  <form class="find" role="search" id="findForm">
+    <svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+    <label class="sr" for="search">Find a value</label>
+    <input id="search" type="search" placeholder="Find a value, e.g. gold 1500" autocomplete="off" spellcheck="false" disabled>
+    <span id="hits" class="hits" aria-live="polite"></span>
+  </form>
+  <div class="actions">
+    <button id="open" class="btn ghost" title="Open a save (Ctrl+O)"><svg class="i" aria-hidden="true"><use href="#i-open"/></svg>Open</button>
+    <button id="saveAs" class="btn ghost" title="Save a copy (Ctrl+Shift+S)" disabled><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>Save a copy</button>
+    <button id="save" class="btn primary" title="Save (Ctrl+S)" disabled><svg class="i" aria-hidden="true"><use href="#i-save"/></svg>Save</button>
+  </div>
+</header>
+
+<div id="banner" class="banner" role="alert" hidden>
+  <svg class="i" aria-hidden="true"><use href="#i-alert"/></svg><span id="bannerText"></span>
+  <button class="icon-btn" id="bannerClose" aria-label="Dismiss"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg></button>
+</div>
+
+<div class="body">
+  <nav class="contents" aria-label="Save contents">
+    <h2 class="bar">Contents</h2>
+    <ol id="toc" class="toc"></ol>
+  </nav>
+  <main id="page" class="page" tabindex="-1"></main>
+</div>
+
+<footer class="status">
+  <span id="stFile">No file open</span>
+  <label class="fmt" id="fmtWrap" hidden>Read as <select id="fmt"><option value="">Auto-detect</option></select></label>
+  <button id="stChanges" class="st-changes" title="Review changes" disabled></button>
+  <span id="stMsg" role="status" class="st-msg"></span>
+  <span id="stUpdate" class="st-update"></span>
+</footer>
+
+<div id="drop" class="drop" hidden><div>Drop the save file to open it</div></div>
+<input id="file" type="file" hidden>
+
+<script src="vendor/pako.min.js"></script>
+<script src="vendor/lz-string.min.js"></script>
+<script src="vendor/jszip.min.js"></script>
+<script src="js/core.js"></script>
+<script src="js/formats/json.js"></script>
+<script src="js/formats/pickle.js"></script>
+<script src="js/formats/marshal.js"></script>
+<script src="js/formats/nrbf.js"></script>
+<script src="js/formats/gvas.js"></script>
+<script src="js/formats/misc.js"></script>
+<script src="js/formats/more.js"></script>
+<script src="js/platform.js"></script>
+<script src="js/app.js"></script>
+<script src="js/live.js"></script>
+</body>
+</html>

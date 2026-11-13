@@ -1,0 +1,389 @@
+// Live game: pick a running program, find a value in its memory, change or lock it while it runs.
+const live = { procs: null, all: false, filter: '', pid: null, name: '', exe: '', bits: 64, kind: 'i32', mode: 'exact', value: '', value2: '', be: false, ci: true, mapped: false,
+  res: null, busy: false, busyText: '', prog: 0, err: '', timer: 0, verdict: {}, tags: null, near: null, entries: [], guide: false };
+const LIVE_KINDS = [['i32', 'Whole number, 4 bytes (most games)'], ['any', 'Any number type'], ['f32', 'Decimal (float)'], ['f64', 'Decimal (double)'],
+  ['i16', 'Whole number, 2 bytes'], ['u8', 'Whole number, 1 byte'], ['i64', 'Whole number, 8 bytes'], ['u32', 'Positive whole number, 4 bytes'],
+  ['u16', 'Positive whole number, 2 bytes'], ['u64', 'Positive whole number, 8 bytes'], ['i8', 'Signed number, 1 byte'],
+  ['utf8', 'Text (UTF-8)'], ['utf16', 'Text (UTF-16, most Windows games)'], ['aob', 'Bytes, like 64 00 ?? 00']];
+const SHORT = { i8: '1-byte', u8: '1-byte', i16: '2-byte', u16: '2-byte', i32: '4-byte', u32: '4-byte', i64: '8-byte', u64: '8-byte', f32: 'Float', f64: 'Double', utf8: 'Text', utf16: 'Text', aob: 'Bytes' };
+const FIRST_MODES = [['exact', 'Exact value'], ['name', 'By name (coins, gold…)'], ['bigger', 'Bigger than'], ['smaller', 'Smaller than'], ['between', 'Between'], ['unknown', 'Unknown starting value']];
+const NEXT_MODES = [['exact', 'Exact value'], ['dec', 'Decreased'], ['inc', 'Increased'], ['decby', 'Decreased by'], ['incby', 'Increased by'], ['changed', 'Changed'], ['unchanged', 'Unchanged'],
+  ['bigger', 'Bigger than'], ['smaller', 'Smaller than'], ['between', 'Between']];
+const NO_VALUE = ['unknown', 'inc', 'dec', 'changed', 'unchanged'];
+const base = k => k.split(':')[0].replace(/be$/, '').replace(/(x10|x100|x1000|d100)$/, '');
+// how the game's number is stored, when it is not stored as shown: "×100" for cents
+const SCALE = { x10: '×10', x100: '×100', x1000: '×1000', d100: '÷100' };
+const scaleOf = k => SCALE[k.split(':')[0].replace(/be$/, '').match(/(x10|x100|x1000|d100)$/)?.[0]] || '';
+const textKind = k => ['utf8', 'utf16', 'aob'].includes(base(k));
+const call = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
+const q = sel => $('page').querySelector(sel);
+
+function openLive() {
+  view = 'live';
+  $('search').value = '';
+  renderAll();
+  if (!live.pid) loadProcs();
+}
+async function loadProcs() {
+  live.procs = null; renderLive();
+  try { live.procs = await call('live_processes', { all: live.all }); } catch (e) { live.procs = []; live.err = String(e); }
+  renderLive();
+}
+const renderLive = () => { if (view === 'live') { const t = $('page').scrollTop; renderPage(); $('page').scrollTop = t; } };
+
+// ---- saved entries, kept per game exe ----
+const entryKey = () => 'live-entries:' + (live.exe || live.name).toLowerCase();
+function loadEntries() { try { return JSON.parse(localStorage.getItem(entryKey()) || '[]'); } catch { return []; } }
+function saveEntries() { try { localStorage.setItem(entryKey(), JSON.stringify(live.entries.map(({ addr, value, note, unsure, ...e }) => e))); } catch { /* private mode: entries last this session */ } }
+// how to find a value again next run: its module, else pointer paths, else the bytes around it
+async function whereIs(h) {
+  const loc = await call('live_locate', { addr: h.addr }).catch(() => null);
+  const sig = loc ? null : await call('live_signature', { addr: h.addr, kind: h.kind }).catch(() => null);
+  let paths = null;
+  if (!loc) { // heap value: find pointer chains from the game's code to it, which survive a restart
+    Object.assign(live, { busy: true, busyText: 'Finding a way to locate it again after a restart…' }); renderLive();
+    paths = await call('live_paths', { addr: h.addr }).catch(() => []);
+    Object.assign(live, { busy: false, busyText: '' });
+  }
+  return { module: loc?.module, offset: loc?.offset, sig, paths, label: h.label, kind: h.kind, addr: h.addr, value: h.value, last: h.value, note: '' };
+}
+async function addEntry(h) {
+  const e = live.refind;
+  // "Find again" after a restart: the old paths that still lead here are the ones that survive restarts
+  const still = e?.paths?.length ? await call('live_paths_still', { paths: e.paths, addr: h.addr }).catch(() => []) : [];
+  const w = await whereIs(h);
+  if (still.length) w.paths = still;
+  if (e) { Object.assign(e, w, { unsure: false }); live.refind = null; }
+  else live.entries.push({ name: h.label || `Value ${live.entries.length + 1}`, frozen: false, ...w });
+  saveEntries();
+  message(still.length ? `Found ${e.name} again. ${plural(still.length, 'path')} to it survived the restart, so next time it is found by itself.`
+    : w.module || w.paths?.length ? (e ? `Found ${e.name} again. If it is lost after the next restart too, Find again once more: each time keeps only the paths that still work.` : 'Saved. It will be found again next time you pick this game.')
+      : 'Saved for now. No stable path to it was found, so next time it may need Find again.');
+  renderLive();
+}
+// a saved value that could not be relocated: scan for its last known value, the user picks the match
+function findAgain(e) {
+  newScan();
+  const head = e.kind.split(':')[0];
+  Object.assign(live, { refind: e, kind: base(e.kind), be: /be$/.test(head), value: e.last ?? '' });
+  if (e.label) Object.assign(live, { mode: 'name', value: e.label.split(' (')[0], value2: e.last ?? '' }); // found by name: search by name again, fewer copies
+  message(`Look for ${e.name} as usual (its last value was ${e.last ?? 'unknown'}), then press Use for ${e.name} on the right match.`);
+  renderLive();
+  q('#liveValue')?.focus();
+}
+// the user checked an unsure entry's number in the game: trust it, and put back its lock
+async function confirmEntry(e) {
+  Object.assign(e, { unsure: false, last: e.value ?? e.last });
+  if (e.frozen) { if (e.lockValue != null) await call('live_write', { addr: e.addr, kind: e.kind, value: e.lockValue }).catch(() => {}); await call('live_freeze', { addr: e.addr, kind: e.kind, on: true }).catch(() => {}); }
+  saveEntries();
+  renderLive();
+}
+async function resolveEntries() {
+  for (const e of live.entries) {
+    try {
+      const r = await call('live_resolve', { module: e.module ?? null, offset: e.offset ?? null, sig: e.sig ?? null, paths: e.paths ?? null, kind: e.kind, last: e.last ?? null });
+      Object.assign(e, { addr: r.addr, unsure: !r.sure, note: '' });
+      if (e.unsure && e.label && e.last != null) { // found by name: the one place with that name and value is it
+        const a = await call('live_by_name', { name: e.label.split(' (')[0], kind: e.kind, value: e.last }).catch(() => []); // label: name (Unreal object)
+        if (a.length === 1) Object.assign(e, { addr: a[0], unsure: false });
+      }
+      if (e.frozen && !e.unsure) { if (e.lockValue != null) await call('live_write', { addr: e.addr, kind: e.kind, value: e.lockValue }); await call('live_freeze', { addr: e.addr, kind: e.kind, on: true }); }
+    } catch (x) { e.addr = null; e.note = String(x); }
+  }
+  renderLive();
+}
+
+async function attach(p) {
+  let info;
+  try { info = await call('live_attach', { pid: p.pid }); } catch (e) { live.err = String(e); return renderLive(); }
+  Object.assign(live, { pid: p.pid, name: p.title || p.name, exe: info.exe || p.name, bits: info.bits, res: null, err: '', near: null, tags: null, verdict: {} });
+  live.entries = loadEntries();
+  renderLive();
+  q('#liveValue')?.focus();
+  clearInterval(live.timer);
+  live.timer = setInterval(liveTick, 1000);
+  if (live.entries.length) resolveEntries();
+}
+async function detach() {
+  clearInterval(live.timer);
+  await call('live_detach');
+  Object.assign(live, { pid: null, res: null, err: '', near: null, tags: null, verdict: {}, entries: [], refind: null });
+  loadProcs();
+}
+async function scan(first) {
+  const mode = q('#liveMode').value;
+  live.value = q('#liveValue')?.value ?? ''; live.value2 = q('#liveValue2')?.value ?? '';
+  if (!NO_VALUE.includes(mode) && !live.value.trim()) { live.err = 'Type the value you see in the game first.'; return renderLive(); }
+  const box = (id, was) => q(id) ? q(id).checked : was; // options not shown for this type keep their setting
+  if (first) Object.assign(live, { kind: q('#liveKind').value, be: box('#liveBe', live.be), ci: box('#liveCi', live.ci), mapped: box('#liveMapped', live.mapped) });
+  Object.assign(live, { mode, busy: true, prog: 0, err: '', verdict: {}, tags: null });
+  renderLive();
+  const poll = setInterval(async () => { live.prog = await call('live_progress'); const b = q('#liveProg'); if (b) { b.value = live.prog; b.textContent = `${live.prog / 10}%`; } }, 150);
+  try { live.res = await call('live_scan', { args: { kind: live.kind, mode, value: live.value, value2: live.value2, first, be: live.be, ci: live.ci, mapped: live.mapped, near: first ? live.near : null } }); }
+  catch (e) { live.err = String(e); }
+  clearInterval(poll);
+  live.busy = false;
+  if (live.res && (first ? mode === 'name' : ['exact', 'incby', 'decby'].includes(mode))) Object.assign(live, { value: '', value2: '' }); // next scans take a number
+  renderLive();
+  q('#liveValue')?.select();
+}
+// Scrambled values (anti-cheat in many games stores money XOR a key): the number never appears as
+// typed, but its bytes still change exactly when it changes. Snapshot everything, then narrow by changed / same.
+async function guide() {
+  newScan();
+  Object.assign(live, { guide: true, mode: 'unknown', kind: 'i32' });
+  renderLive();
+  await scan(true);
+}
+async function guideStep(mode) {
+  live.mode = mode;
+  renderLive();
+  q('#liveMode').value = mode;
+  await scan(false);
+}
+function newScan() { Object.assign(live, { guide: false, refind: null, res: null, err: '', verdict: {}, near: null, mode: 'exact', value: '', value2: '' }); renderLive(); q('#liveValue')?.focus(); }
+
+// ---- telling the real value from copies ----
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const readAll = async () => Object.fromEntries((await call('live_read')).hits.map(h => [h.addr, h.value]));
+const kindOf = addr => live.res?.hits.find(h => h.addr === addr)?.kind || live.kind;
+const put = (addr, value) => call('live_write', { addr, kind: kindOf(addr), value }).catch(() => {});
+// a number the game would not show by itself, different from every current match
+function testNumber(addr, v, taken) {
+  let t = Math.trunc(Number(v) || 0) + 37;
+  for (;;) { if (/^[iu]8/.test(kindOf(addr))) t = ((t % 128) + 128) % 128; if (!taken.has(String(t))) return String(t); t++; }
+}
+
+// Sets each match to a test number for a moment and watches the game:
+// the real value drives its copies (they follow), a display copy gets put back by the game.
+async function findReal() {
+  const hits = live.res.hits.filter(h => !h.frozen);
+  live.busy = true; live.verdict = {}; live.err = '';
+  const orig = await readAll(), taken = new Set(Object.values(orig));
+  for (const [i, h] of hits.entries()) {
+    live.busyText = `Testing match ${i + 1} of ${hits.length}…`; renderLive();
+    const t = testNumber(h.addr, orig[h.addr], taken);
+    try { await call('live_write', { addr: h.addr, kind: h.kind, value: t }); } catch { live.verdict[h.addr] = { score: -1, note: 'Cannot be changed' }; continue; }
+    await sleep(700);
+    const now = await readAll();
+    const followers = Object.keys(now).filter(a => a !== h.addr && now[a] === t);
+    await put(h.addr, orig[h.addr]);
+    await sleep(300);
+    const after = await readAll();
+    for (const a of followers) if (after[a] === t) await put(a, orig[a]);
+    live.verdict[h.addr] = now[h.addr] !== t ? { score: 0, note: 'The game puts it back: just a copy' }
+      : followers.length ? { score: 3, note: `Most likely the real one: ${followers.length} ${followers.length === 1 ? 'copy' : 'copies'} followed it` }
+        : { score: 1, note: 'Kept the test number. Check it in the game' };
+  }
+  live.busy = false; live.busyText = '';
+  message('Test done. Every value is back to what it was.');
+  renderLive();
+}
+// Gives every match its own number at once; the one the game shows identifies the real value.
+async function tagAll() {
+  const orig = await readAll(), addrs = Object.keys(orig).filter(a => !live.res.hits.find(h => h.addr === a)?.frozen);
+  const top = Math.max(...Object.values(orig).map(Number).filter(Number.isFinite), 0);
+  let n = addrs.some(a => /^[iu]8/.test(kindOf(a))) ? 51 : (Math.floor(top / 1000) + 2) * 1000 + 1; // e.g. 48920 -> 50001, 50002…
+  const taken = new Set(Object.values(orig)), map = {};
+  for (const a of addrs) { while (taken.has(String(n))) n++; map[a] = { t: String(n), orig: orig[a] }; await put(a, String(n)); n++; }
+  live.tags = map;
+  await sleep(500); // a copy the game refreshes from somewhere else loses its test number at once
+  const now = await readAll();
+  for (const a of addrs) if (now[a] !== map[a].t) live.verdict[a] = { score: 0, note: 'Copy: the game rewrites it' };
+  message('Each match now holds its own number. Look at the game.');
+  renderLive();
+  q('#tagSeen')?.focus();
+}
+async function untag(keep) {
+  const tags = live.tags; live.tags = null;
+  for (const [a, x] of Object.entries(tags)) await put(a, x.orig);
+  if (keep) { live.res = await call('live_keep', { addrs: [keep] }); live.verdict = {}; message('Found the value the game shows. Change it below.'); }
+  else {
+    for (const a of Object.keys(tags)) live.verdict[a] ??= { score: 0, note: 'Not the one the game shows' };
+    message('Put every value back. None of them is the one the game shows: try Look for the hidden source.');
+  }
+  renderLive();
+}
+// every match is a copy: the real value is stored another way (8 bytes, decimal, times 100…)
+async function hiddenSource() {
+  const r = live.res, copies = new Set(r.hits.map(h => h.addr)), v = r.hits[0]?.value ?? live.value;
+  newScan();
+  Object.assign(live, { kind: 'any', value: v });
+  renderLive();
+  await scan(true);
+  for (const h of live.res?.hits ?? []) if (copies.has(h.addr)) live.verdict[h.addr] = { score: 0, note: 'Copy found before' };
+  message(`Searched every number type and scale for ${v}. Matches stored another way show their type; Find the real one tests them.`);
+  renderLive();
+}
+function nextTo(addr) { Object.assign(live, { near: addr, res: null, verdict: {}, err: '' }); renderLive(); q('#liveValue')?.focus(); }
+async function hideCopies() {
+  live.res = await call('live_keep', { addrs: live.res.hits.filter(h => (live.verdict[h.addr]?.score ?? 1) > 0).map(h => h.addr) });
+  renderLive();
+}
+
+// update values in place so typing in a box is not interrupted
+function fill(sel, value) { const input = q(sel); if (input && document.activeElement !== input) input.value = value; }
+async function liveTick() {
+  if (view !== 'live' || live.busy) return;
+  if (live.res?.hits.length) {
+    try { live.res = await call('live_read'); } catch (e) { if (!/scan is running/.test(e)) { live.err = String(e); clearInterval(live.timer); return renderLive(); } }
+    for (const h of live.res.hits) fill(`input[data-addr="${h.addr}"]`, h.value);
+  }
+  const ok = live.entries.filter(e => e.addr);
+  let changed = false;
+  if (ok.length) (await call('live_values', { items: ok.map(e => [e.addr, e.kind]) })).forEach((v, i) => { ok[i].value = v; if (v !== '?' && !ok[i].unsure && ok[i].last !== v) { ok[i].last = v; changed = true; } fill(`input[data-entry="${ok[i].addr}"]`, v); });
+  if (changed) saveEntries(); // remembered for Find again
+}
+
+function valueBox(addr, kind, value, attr, after) {
+  const err = el('div', { class: 'err', hidden: true });
+  const input = el('input', { type: 'text', value, [attr]: addr, 'aria-label': `Value at ${addr}`, spellcheck: 'false', inputmode: textKind(kind) ? 'text' : 'decimal' });
+  input.onchange = async () => {
+    try {
+      const want = input.value; // the 1 s refresh may overwrite the box meanwhile
+      await call('live_write', { addr, kind, value: want }); err.hidden = true; input.removeAttribute('aria-invalid'); message(`Wrote ${input.value} at ${addr}.`); after?.(input.value);
+      await sleep(600); // a display copy is put back by the game at once
+      const [now] = await call('live_values', { items: [[addr, kind]] });
+      if (attr === 'data-addr' && !textKind(kind) && Number(now) !== Number(want)) {
+        live.verdict[addr] = { score: 0, note: 'Copy: the game rewrites it' };
+        message(`The game put ${addr} back to ${now}: it only shows a copy. Press Look for the hidden source.`);
+        renderLive();
+      }
+    }
+    catch (e) { err.replaceChildren(icon('alert'), String(e)); err.hidden = false; input.setAttribute('aria-invalid', 'true'); }
+  };
+  return el('div', { class: 'val' }, input, err);
+}
+function lockBox(addr, kind, on, after) {
+  const lock = el('input', { type: 'checkbox', class: 'check', checked: on, 'aria-label': `Lock value at ${addr}`,
+    onchange: async () => { try { await call('live_freeze', { addr, kind, on: lock.checked }); after?.(lock.checked); } catch (e) { lock.checked = !lock.checked; message(String(e)); } } });
+  return lock;
+}
+const opt = (list, cur) => list.map(([k, l]) => el('option', { value: k, selected: k === cur }, l));
+const toggle = (id, label, on, title) => el('label', { class: 'live-opt', title }, el('input', { type: 'checkbox', class: 'check', id, checked: on }), label);
+
+function pickerView(sheet) {
+  sheet.prepend(tip('Start the game first, then pick it here. Use this only on single-player games: online games and anti-cheat can ban accounts for it.'));
+  const f = live.filter.toLowerCase();
+  const list = (live.procs || []).filter(p => !f || p.name.toLowerCase().includes(f) || p.title.toLowerCase().includes(f) || String(p.pid) === f);
+  const find = el('input', { type: 'search', class: 'live-input', placeholder: 'Filter by name or window title', value: live.filter, 'aria-label': 'Filter running programs',
+    oninput: () => { live.filter = find.value; renderLive(); const x = q('.live-input'); x.focus(); x.setSelectionRange(x.value.length, x.value.length); } });
+  const all = el('label', { class: 'live-opt' }, el('input', { type: 'checkbox', class: 'check', checked: live.all, onchange: e => { live.all = e.target.checked; loadProcs(); } }), 'Show background programs too');
+  sheet.append(el('div', { class: 'live-bar' }, find, el('button', { class: 'btn dark', onclick: loadProcs }, icon('refresh'), 'Refresh'), all));
+  if (!live.procs) sheet.append(el('p', { class: 'more' }, 'Looking for running programs…'));
+  else if (!list.length) sheet.append(el('div', { class: 'empty' }, el('h2', {}, 'No match'), el('p', {}, live.all ? 'Is the game running? Try part of its name, or Refresh.' : 'Is the game running? Try Show background programs too.')));
+  else sheet.append(table(['Program', 'Process', ''], list.slice(0, 400).map(p => el('tr', {},
+    el('td', { class: 'name' }, el('div', { class: 'live-proc' }, p.icon ? el('img', { src: p.icon, alt: '', width: 24, height: 24 }) : el('span', { class: 'live-noicon' }),
+      el('div', {}, el('div', {}, p.title || p.name), p.title ? el('div', { class: 'live-sub' }, p.name) : null))),
+    el('td', { class: 'live-sub' }, `${p.pid}`, p.bits === 32 ? ' · 32-bit' : '', p.children ? ` · +${p.children} helper${p.children === 1 ? '' : 's'}` : ''),
+    el('td', { class: 'act' }, el('button', { class: 'link', onclick: () => attach(p) }, 'Pick', icon('right')))))));
+  return [band('Live game', [el('span', {}, 'Change values in a running game'), el('span', {}, live.procs ? plural(list.length, 'program') : '')], '#0f7272'), sheet];
+}
+
+function liveView() {
+  document.documentElement.style.setProperty('--sec', '#0f7272');
+  const sheet = el('div', { class: 'sheet live-sheet' });
+  if (live.err) {
+    const admin = live.err.startsWith('admin:');
+    sheet.append(el('div', { class: 'err live-err', role: 'alert' }, icon('alert'), admin ? live.err.slice(6) : live.err,
+      admin ? el('button', { class: 'btn dark', onclick: () => call('live_elevate').catch(e => { live.err = String(e); renderLive(); }) }, 'Restart as administrator') : null));
+  }
+  if (!live.pid) return pickerView(sheet);
+
+  const r = live.res, text = textKind(live.kind);
+  if (live.guide && r) {
+    const few = !r.snapshot && r.count <= 30;
+    sheet.append(el('div', { class: 'tip ask-panel', role: 'status' }, el('b', {}, 'Step'),
+      el('div', { class: 'ask' }, el('p', {}, r.count === 0 ? 'Nothing is left. The value may be a decimal or 8 bytes: press New scan, pick that type in Value type, then Unknown starting value.'
+        : few ? `${plural(r.count, 'place')} left. Tick Lock on them to keep the value as it is now. Raise it in the game first if you want more. Typing a number here won't work: the game scrambles it.`
+          : `${r.count.toLocaleString()}${r.capped ? '+' : ''} places could hold it. Change the value in the game (spend or earn some), then press It changed. Or play a little without changing it and press It stayed the same. Repeat until few are left.`),
+        r.count && !few ? el('div', { class: 'ask-btns' },
+          el('button', { class: 'btn primary', disabled: live.busy, onclick: () => guideStep('changed') }, icon('refresh'), 'It changed'),
+          el('button', { class: 'btn dark', disabled: live.busy, onclick: () => guideStep('unchanged') }, icon('check'), 'It stayed the same')) : null)));
+  }
+  if (!(live.guide && r)) sheet.prepend(tip(!r && live.mode === 'name' ? 'Type what the game might call the value (coins, gold, stars, money) and, if you can see it, its number now. Works best in games made with Lua, JavaScript or Python, or with many named settings.'
+    : !r ? 'Type a number you can see in the game, like your gold, and press First scan. No number on screen (a health bar)? Pick Unknown starting value.'
+    : r.snapshot ? `Saved ${r.count.toLocaleString()} possible places. Make the value change in the game, then pick Decreased, Increased or Changed and press Next scan.`
+      : r.count === 1 && live.verdict[r.hits[0]?.addr]?.score <= 0 ? 'This is only a copy the game shows: it puts the number back. Press Look for the hidden source to search every other way the game may store it.'
+      : r.count > 1 ? 'Make the value change in the game (spend some gold, take a hit), then press Next scan with the new value, or with Decreased / Increased. Once only a few are left, press Tag them all to see which one the game shows.'
+        : r.count === 1 ? 'Found it. Change the value below, tick Lock to keep it from changing, or Save it to find it again next time.'
+          : live.mode === 'name' ? 'Nothing has that name. Try a shorter part of it (coin, gold), or search by the number instead: many games keep names only in their compiled code.'
+          : 'Nothing matched. Check the type, or press New scan and try Unknown starting value: some games store a number differently from how they show it (times 10, or scrambled).'));
+  const modes = (r ? NEXT_MODES : FIRST_MODES).filter(([m]) => !text || ['exact', 'changed', 'unchanged'].includes(m));
+  if (live.mode === 'name' && live.kind === 'any') live.kind = 'i32';
+  if (!modes.some(([m]) => m === live.mode)) live.mode = modes[0][0];
+  const go = () => scan(!r);
+  const keys = e => { if (e.key === 'Enter') { e.preventDefault(); go(); } };
+  const mode = el('select', { id: 'liveMode', class: 'live-select', 'aria-label': 'Scan type', disabled: live.busy, onchange: () => { live.value = q('#liveValue')?.value ?? live.value; live.mode = mode.value; renderLive(); } }, opt(modes, live.mode));
+  const needs = !NO_VALUE.includes(live.mode);
+  const value = needs ? el('input', { id: 'liveValue', type: 'text', class: 'live-input', value: live.value, inputmode: text || live.mode === 'name' ? 'text' : 'decimal', spellcheck: 'false', onkeydown: keys,
+    placeholder: live.mode === 'name' ? 'Name, e.g. coins' : live.kind === 'aob' ? 'Bytes, e.g. 64 00 ?? 00' : text ? 'Text, e.g. a hero name' : live.mode === 'between' ? 'From' : ['incby', 'decby'].includes(live.mode) ? 'By how much' : 'Value, e.g. 1500', 'aria-label': 'Value to find' }) : null;
+  const value2 = needs && ['between', 'name'].includes(live.mode) ? el('input', { id: 'liveValue2', type: 'text', class: 'live-input short', value: live.value2, inputmode: 'decimal', onkeydown: keys,
+    placeholder: live.mode === 'name' ? 'Value now' : 'To', 'aria-label': live.mode === 'name' ? 'Value it has now, optional' : 'Upper value' }) : null;
+  const kind = el('select', { id: 'liveKind', class: 'live-select', 'aria-label': 'Value type', disabled: !!r || live.busy, onchange: () => { live.value = q('#liveValue')?.value ?? ''; live.kind = kind.value; renderLive(); } }, opt(LIVE_KINDS, live.kind));
+  sheet.append(el('div', { class: 'live-bar' }, mode, value, value2, kind,
+    el('button', { class: 'btn primary', disabled: live.busy, onclick: go }, icon('search'), r ? 'Next scan' : 'First scan'),
+    r && !r.snapshot && r.count > 1 && r.count <= 200 && !live.tags && !text && !live.guide ? el('button', { class: 'btn dark', disabled: live.busy, title: 'Briefly sets each match to a test number to see which one the game really uses', onclick: findReal }, icon('check'), 'Find the real one') : null,
+    r && !r.snapshot && r.count > 1 && r.count <= 50 && !live.tags && !text && !live.guide ? el('button', { class: 'btn dark', disabled: live.busy, title: 'Give every match its own number, then type the one the game shows', onclick: tagAll }, icon('search'), 'Tag them all') : null,
+    r && r.count === 1 && !live.near ? el('button', { class: 'btn dark', onclick: () => nextTo(r.hits[0].addr) }, icon('right'), 'Find a value next to it') : null,
+    Object.keys(live.verdict).length ? el('button', { class: 'btn dark', disabled: live.busy, onclick: hideCopies }, icon('x'), 'Hide copies') : null,
+    r && r.count && !live.tags && live.kind !== 'any' && r.hits.every(h => (live.verdict[h.addr]?.score ?? 1) <= 0) ? el('button', { class: 'btn dark', disabled: live.busy, title: 'Every match is a copy. Search all number types and scales for the value the copies show', onclick: hiddenSource }, icon('search'), 'Look for the hidden source') : null,
+    r ? el('button', { class: 'btn dark', disabled: live.busy || !!live.tags, onclick: newScan }, icon('refresh'), 'New scan') : null));
+  if (!r) sheet.append(el('div', { class: 'live-bar live-opts' },
+    text ? (live.kind === 'aob' ? null : toggle('liveCi', 'Ignore upper/lower case', live.ci)) : toggle('liveBe', 'Big-endian (consoles, emulators)', live.be, 'Byte order used by PowerPC consoles and some emulators'),
+    toggle('liveMapped', 'Include shared memory', live.mapped, 'Also search memory shared with other programs; emulators often keep the game there. Slower.')));
+  if (!r || (r.count === 0 && !live.guide)) sheet.append(el('p', { class: 'more' }, r ? 'Still not found? ' : 'Can’t find it by its number? Some games scramble values. ',
+    el('button', { class: 'link', disabled: live.busy, onclick: guide }, 'Find a scrambled value')));
+  if (live.near && !r) sheet.append(el('p', { class: 'more' }, `Searching only next to ${live.near}, where related values (stars, lives, ammo) are often stored. `,
+    el('button', { class: 'link', onclick: () => { live.near = null; renderLive(); } }, 'Search everywhere instead')));
+  if (live.tags) {
+    const seen = el('input', { id: 'tagSeen', type: 'text', class: 'live-input', inputmode: 'numeric', placeholder: 'Number the game shows', 'aria-label': 'Number the game shows now' });
+    const pick = () => { const hit = Object.entries(live.tags).find(([, x]) => x.t === seen.value.trim()); if (hit) untag(hit[0]); else { live.err = `None of the matches holds ${seen.value.trim() || 'that'}. Check the game again, or press None of them.`; renderLive(); } };
+    seen.onkeydown = e => { if (e.key === 'Enter') pick(); };
+    sheet.append(el('div', { class: 'tip ask-panel' }, el('b', {}, 'Look'),
+      el('div', { class: 'ask' }, el('p', {}, `Every match now holds its own number (${Object.values(live.tags)[0].t} and up). Look at the game; if it still shows the old value, open another screen and come back. Which number does it show?`),
+        el('div', { class: 'ask-btns' }, seen, el('button', { class: 'btn primary', onclick: pick }, icon('check'), 'That’s the one'), el('button', { class: 'btn dark', onclick: () => untag(null) }, 'None of them')))));
+  }
+  if (live.busy && !live.busyText) sheet.append(el('div', { class: 'live-bar', role: 'status' },
+    el('progress', { id: 'liveProg', class: 'live-prog', max: 1000, value: live.prog, 'aria-label': 'Scan progress' }, `${live.prog / 10}%`),
+    el('span', { class: 'more' }, r ? 'Checking the matches…' : 'Searching the game’s memory…'),
+    el('button', { class: 'btn dark', onclick: () => call('live_cancel') }, icon('x'), 'Cancel')));
+  else if (live.busy) sheet.append(el('p', { class: 'more', role: 'status' }, live.busyText));
+  else if (r && r.hits.length) {
+    const any = new Set(r.hits.map(h => base(h.kind) + scaleOf(h.kind))).size > 1 || live.kind === 'any';
+    sheet.append(table([r.hits.some(h => h.label) ? 'Name' : 'Address', any ? 'Type' : null, 'Value', 'Lock', '', 'Is it the one?'].filter(x => x !== null), [...r.hits].sort((a, b) => (live.verdict[b.addr]?.score ?? 0.5) - (live.verdict[a.addr]?.score ?? 0.5)).map(h => {
+      const v = live.verdict[h.addr], tag = live.tags?.[h.addr];
+      const test = el('div', { class: 'ask' }, tag ? el('span', { class: 'verdict best' }, `Tagged ${tag.t}`) : null,
+        v ? el('span', { class: v.score >= 3 ? 'verdict best' : v.score <= 0 ? 'verdict no' : 'verdict' }, v.note) : null,
+        r.count === 1 && !(v?.score <= 0) ? el('span', { class: 'verdict best' }, 'This is the one') : null);
+      const saved = live.entries.some(e => e.addr === h.addr);
+      return el('tr', {}, el('td', { class: 'name mono' }, h.label ? el('div', {}, el('div', {}, h.label), el('div', { class: 'live-sub' }, h.addr)) : h.addr), any ? el('td', { class: 'live-sub' }, `${SHORT[base(h.kind)]} ${scaleOf(h.kind)}`.trim()) : null,
+        el('td', {}, valueBox(h.addr, h.kind, h.value, 'data-addr')), el('td', {}, lockBox(h.addr, h.kind, h.frozen)),
+        el('td', { class: 'act' }, live.refind ? el('button', { class: 'link', onclick: () => addEntry(h) }, `Use for ${live.refind.name}`)
+          : el('button', { class: 'link', disabled: saved, onclick: () => addEntry(h) }, saved ? 'Saved' : 'Save')), el('td', {}, test));
+    })));
+  }
+  if (r && !r.snapshot && r.count > r.hits.length) sheet.append(el('p', { class: 'more' }, `Showing ${r.hits.length} of ${r.count.toLocaleString()}${r.capped ? '+' : ''}. Narrow it down with Next scan.`));
+  if (live.entries.length) sheet.append(el('h2', { class: 'live-h' }, 'Saved values'), table(['Name', 'Type', 'Where', 'Value', 'Lock', ''], live.entries.map((e, i) => {
+    const name = el('input', { type: 'text', value: e.name, 'aria-label': 'Name', spellcheck: 'false', onchange: () => { e.name = name.value; saveEntries(); } });
+    return el('tr', {}, el('td', {}, el('div', { class: 'val' }, name)), el('td', { class: 'live-sub' }, `${SHORT[base(e.kind)]} ${scaleOf(e.kind)}`.trim()),
+      el('td', { class: 'live-sub mono', title: e.module ? 'Same place every run' : e.paths?.length ? `Found through ${plural(e.paths.length, 'pointer path')} from the game’s code` : 'Found again by the bytes around it' },
+        e.addr ? el('div', { class: 'ask' }, e.module ? `${e.module}+${e.offset}` : e.paths?.length ? `${e.paths[0].module}${e.paths[0].module.startsWith('THREADSTACK') ? '-' : '+'}${e.paths[0].offset} → ${e.paths[0].offs.length} ${e.paths[0].offs.length === 1 ? 'jump' : 'jumps'}` : e.addr,
+          null)
+          : e.note ? el('div', { class: 'ask' }, el('span', {}, e.note), el('button', { class: 'link', onclick: () => findAgain(e) }, 'Find again')) : 'Finding…'),
+      el('td', {}, e.addr ? valueBox(e.addr, e.kind, e.value ?? '', 'data-entry', v => { if (e.frozen) { e.lockValue = v; saveEntries(); } }) : null,
+        e.unsure ? el('p', { class: 'live-note', role: 'note' }, 'Not sure this is it. Does the game show this number? ', el('button', { class: 'link', onclick: () => confirmEntry(e) }, 'Yes, it’s right'), ' or Find again.') : null),
+      el('td', {}, e.addr ? lockBox(e.addr, e.kind, e.frozen, on => { e.frozen = on; e.lockValue = on ? q(`input[data-entry="${e.addr}"]`)?.value : null; saveEntries(); }) : null),
+      el('td', { class: 'act' }, e.addr ? el('button', { class: 'link', title: 'Shows the wrong number? Look for it again; the paths that still work are kept.', onclick: () => findAgain(e) }, 'Find again') : null,
+        el('button', { class: 'link', 'aria-label': `Remove ${e.name}`, onclick: async () => { if (e.addr && e.frozen) await call('live_freeze', { addr: e.addr, kind: e.kind, on: false }).catch(() => {}); live.entries.splice(i, 1); saveEntries(); renderLive(); } }, icon('x'))));
+  })));
+  const meta = [el('span', {}, `Process ${live.pid}${live.bits === 32 ? ' · 32-bit' : ''}`), r ? el('span', {}, `${r.count.toLocaleString()}${r.capped ? '+' : ''} ${r.snapshot ? 'possible places' : r.count === 1 ? 'match' : 'matches'}`) : null,
+    el('button', { class: 'link light', onclick: detach }, 'Pick another program')];
+  return [band(live.name, meta, '#0f7272'), sheet];
+}
+
+if (platform.desktop) {
+  const b = el('button', { id: 'live', class: 'btn ghost', title: 'Change values in a running game' }, icon('zap'), 'Live game');
+  b.onclick = openLive;
+  $('open').before(b);
+}
